@@ -103,6 +103,9 @@ podman run --rm -it \
   --userns=keep-id \
   --cpus="$TARGET_CPU" \
   --memory="$TARGET_MEM" \
+  --pids-limit=-1 \
+  --ulimit nproc=16384:16384 \
+  --ulimit nofile=65536:65536 \
   -e GRADLE_USER_HOME="$CONTAINER_GRADLE_HOME" \
   -v "$PROJECT_DIR":"/source_ro:ro,z" \
   -v "$GRADLE_USER_HOME":"$CONTAINER_GRADLE_HOME:O" \
