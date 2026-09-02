@@ -7,6 +7,12 @@
 #   scan_cve.sh 4.2          # auto-resolves to origin/4.2
 #   scan_cve.sh 8c0bc0ca
 #
+# env:
+#   KAFKA_SRC        path to the Kafka git checkout   (default: ~/project/kafka)
+#   KAFKA_SCAN_WORK  temp dir for worktree + tarball  (default: ~/cve-scan/work)
+#   KAFKA_SCAN_OUT   where results are written        (default: ~/cve-scan/out)
+#   GRYPE_IMAGE      grype container image            (default: docker.io/anchore/grype:latest)
+#
 # outputs: one directory per scan under $OUT
 #   <ref>-<sha>/grype.json     full grype report (CVE ids preferred)
 #   <ref>-<sha>/ids.txt        sorted unique vulnerability IDs, for comm/diff
@@ -24,6 +30,12 @@ GRYPE_IMAGE="${GRYPE_IMAGE:-docker.io/anchore/grype:latest}"
 NAME="${REF//\//-}"                      # origin/4.2 -> origin-4.2
 TREE="$WORK/$NAME"
 DIST="$WORK/$NAME-dist"
+
+if [ ! -d "$SRC/.git" ]; then
+  echo "error: Kafka repository not found at $SRC" >&2
+  echo "       set KAFKA_SRC to your checkout, e.g. KAFKA_SRC=~/kafka scan_cve.sh $REF" >&2
+  exit 1
+fi
 
 mkdir -p "$WORK" "$OUT" "$HOME/.cache/grype"
 
