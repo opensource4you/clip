@@ -13,6 +13,8 @@ stderr 會印每個階段的秒數、請求數、304 命中數和等待額度的
   python gh_activity.py --config people.json [--detail]                  # 多人多 repo，預設只印總表
   python gh_activity.py --config https://gist.githubusercontent.com/.../raw/people.json
   python gh_activity.py --config people.json --since 2026-01-01 --until 2026-09-17
+  python gh_activity.py --config people.json --dump out/                  # 另外替每個人寫一個 out/<帳號>.md：
+                                                                           # 評分明細 + 區間內所有留言全文（含行內留言的 diff 片段）
 
 people.json 格式（每個人都查全部 repo）：
   {
@@ -32,6 +34,8 @@ people.json 格式（每個人都查全部 repo）：
   review ≈ 重要貢獻 > 一般貢獻
 一個 PR 先算「重要性」分數（有沒有 production code、討論多深、改動多大），達 IMPORTANT_PR_MIN 的全額計入，
 未達的打折；沒 merge 的 PR 先算 1/4，被關掉的不計。
+Review 分只把「實質意見」當成有在認真 review 的證據：非 nit 的行內留言，或 40 字以上的結論。短留言和只挑格式的
+nit（nit: 開頭、行尾空白、換行、typo、縮排，見 is_nit）深度分打折，而且不觸發 request changes、首評、帶非 committer 的加分。
 
 多 repo 的合併規則：總分各 repo 相加；品質分把該人所有 repo 的 PR 放在一起取前 N。
 """
@@ -82,7 +86,7 @@ QUALITY_TOP_N_REVIEW = 5   # Review 品質分：同上。取 5 個而不是 10 �
 DEEP_REVIEW_INLINE = 10    # 行內留言達這個數量算「深度 review」，總表單獨列出個數，並額外加 REVIEW_WEIGHTS["deep_review"]
 # Review 品質 = 深度（前 N 名平均）＋ 廣度。廣度用對數，只區分量級，不線性放大（量已在數量分算過）
 REVIEW_BREADTH = {
-    "substantive_log": 1.0,   # + log2(1 + 實質 review 數)：有行內意見、request changes 或 40 字以上結論的 review
+    "substantive_log": 1.0,   # + log2(1 + 實質 review 數)：有非 nit 的行內意見或 40 字以上結論的 review（見 is_nit）
     "mentored_log": 1.5,      # + 1.5 × log2(1 + 帶非 committer 數)
 }
 # 樣本不足 N 個時，缺的名額用基準值補（拉向一般水準，不當 0 也不當高估）。
@@ -96,15 +100,15 @@ REVIEW_WEIGHTS = {
     "issue_comment": 0.5,       # PR 下方一般留言，每則
     "review_body": 1.0,         # 有文字內容的 review 結論，每則
     "approved_merged": 1.0,     # 給了 approve 且 PR 後來有 merge（每個 PR 一次）。原 2.0；降低是為了讓純 approve 不值錢，實質意見才有分
-    "changes_requested": 2.0,   # 給過 request changes（每個 PR 一次）
-    "short_factor": 0.25,       # 少於 SHORT_LEN 字的留言（LGTM、+1 之類）打折
+    "changes_requested": 2.0,   # 給過 request changes，且在這個 PR 上至少有一則實質意見（每個 PR 一次）。只為 nit 按 request changes 不加分
+    "short_factor": 0.25,       # 短留言（少於 SHORT_LEN 字，LGTM、+1 之類）和只挑格式的 nit（見 is_nit）打折
     # 留言累加後取對數再乘 comment_log_scale：1.5 × log2(1 + 累加值)。
     # 1 則 = 1.5、5 則 ≈ 3.9、10 則 ≈ 5.2、30 則 ≈ 7.4。避免無上限膨脹，但深的 review 仍要拉得開
     "comment_log": True,
     "comment_log_scale": 1.5,
-    "first_reviewer": 1.0,      # 這個 PR 上第一個留下實質意見的人（行內、request changes、或 40 字以上結論；純 approve 不算）
+    "first_reviewer": 1.0,      # 這個 PR 上第一個留下實質意見的人（非 nit 的行內意見或 40 字以上結論；純 approve、只有 nit、沒文字的 request changes 都不算）
     "acted_on": 1.0,            # 留下實質意見後 PR 有再 push 新 commit（可能是 review 起了作用，訊號不確定所以分數低，每個 PR 一次）
-    "mentored": 8.0,            # 帶非 committer：作者不是 committer、本人留 MENTOR_MIN_INLINE 則以上行內意見或 request changes、PR 最後 merge。原 4.0
+    "mentored": 8.0,            # 帶非 committer：作者不是 committer、本人留 MENTOR_MIN_INLINE 則以上非 nit 的行內意見或（有實質意見的）request changes、PR 最後 merge。原 4.0
     "deep_review": 3.0,         # 深度 review：行內留言達 DEEP_REVIEW_INLINE 則（每個 PR 一次）。留言的對數分壓得很扁，這裡把深度拉開
     "newcomer_factor": 1.5,     # 作者是第一次貢獻者或沒有關聯的人，留言深度的部分乘上這個倍數（固定加分不乘）
     "contributor_factor": 1.2,  # 作者是非 committer 的貢獻者
@@ -121,6 +125,34 @@ def is_bot(login):
     return not login or login.endswith("[bot]") or login.lower() in BOT_LOGINS
 
 SHORT_LEN = 40
+# 只挑格式的 nit：以 nit 開頭，或整則很短且只提行尾空白、換行、typo、縮排這類東西。
+# 視同短留言：深度分打 short_factor，而且不算實質意見（不觸發 first_reviewer / changes_requested / mentored / acted_on）。
+# 長留言即使提到 indent、newline 也不算 nit，避免誤殺真正的意見；開頭標 nit: 的一律算 nit，尊重作者自己的分類。
+NIT_MAX_LEN = 120
+NIT_PREFIX = re.compile(r"^\s*(nit|nits|nitpick|minor|style)\b", re.I)
+NIT_KEYWORDS = re.compile(
+    r"trailing\s*(white)?space|white\s*space|new\s*line|end of file|\bEOF\b|\btypos?\b|\bspelling\b"
+    r"|\bindent(ation|ed)?\b|unused import|import order|blank line|extra space|missing space|\bperiod\b|\bcomma\b", re.I)
+
+
+def is_nit(body):
+    """短留言（LGTM、+1、Done）或只挑格式的 nit。"""
+    b = (body or "").strip()
+    if len(b) < SHORT_LEN or NIT_PREFIX.match(b):
+        return True
+    return len(b) <= NIT_MAX_LEN and bool(NIT_KEYWORDS.search(b))
+
+
+def is_substantive(kind, body, state=None):
+    """一則留言算不算實質意見：非 nit 的行內留言，或非 nit 且 40 字以上的 review 結論。
+    一般留言（issue comment）不算：多半是 CI、rebase、進度之類的對話。沒文字的 request changes 也不算。"""
+    if kind == "review_comment":
+        return not is_nit(body)
+    if kind == "review":
+        return len((body or "").strip()) >= SHORT_LEN and not is_nit(body)
+    return False
+
+
 CONFIG_FILES = {"pom.xml", "build.gradle", "settings.gradle", "gradlew", "gradlew.bat", "package.json",
                 "package-lock.json", "requirements.txt", "pyproject.toml", "setup.py", "makefile",
                 "dockerfile", "codeowners", "license", "notice"}
@@ -423,19 +455,25 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
     W = REVIEW_WEIGHTS
     depth, cnt = 0.0, Counter()
     for c in mine:
-        short = len(c["body"].strip()) < SHORT_LEN
-        factor = W["short_factor"] if short else 1.0
+        factor = W["short_factor"] if is_nit(c["body"]) else 1.0
         if c["type"] == "review_comment":
             depth += W["review_comment"] * factor; cnt["review_comment"] += 1
+            if is_substantive("review_comment", c["body"]):
+                cnt["inline_sub"] += 1
         elif c["type"] == "issue_comment":
             depth += W["issue_comment"] * factor; cnt["issue_comment"] += 1
         elif c["type"] == "review":
             cnt["review"] += 1
             if c["body"].strip():
                 depth += W["review_body"] * factor
+            if is_substantive("review", c["body"]):
+                cnt["review_sub"] += 1
     if W["comment_log"] and depth > 0:
         depth = W["comment_log_scale"] * math.log2(1 + depth)
     states = {c["review_state"] for c in mine if c["type"] == "review"}
+    # 這個 PR 上有沒有實質意見（非 nit 的行內留言，或 40 字以上的結論）。沒有的話，
+    # request changes、首評、帶非 committer 這些「有在認真 review」的加分都不給
+    has_sub = cnt["inline_sub"] + cnt["review_sub"] > 0
     reasons = []
     assoc = pr.get("author_association") or "NONE"
     if assoc in NEWCOMER:
@@ -445,26 +483,28 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
     s = depth
     if "APPROVED" in states and pr["merged_at"]:
         s += W["approved_merged"]; reasons.append("approved_merged")
-    if "CHANGES_REQUESTED" in states:
+    changes_requested = "CHANGES_REQUESTED" in states and has_sub
+    if changes_requested:
         s += W["changes_requested"]; reasons.append("changes_requested")
+    elif "CHANGES_REQUESTED" in states:
+        reasons.append("changes_requested_nit_only")
     if first_reviewer:
         s += W["first_reviewer"]; reasons.append("first_reviewer")
     deep = cnt["review_comment"] >= DEEP_REVIEW_INLINE
     if deep:
         s += W["deep_review"]; reasons.append("deep_review")
-    mentored =(assoc in NON_COMMITTER and pr["merged_at"]
-                and (cnt["review_comment"] >= MENTOR_MIN_INLINE or "CHANGES_REQUESTED" in states))
+    mentored = (assoc in NON_COMMITTER and pr["merged_at"]
+                and (cnt["inline_sub"] >= MENTOR_MIN_INLINE or changes_requested))
     if mentored:
         s += W["mentored"]; reasons.append("mentored")
     if acted_on:
         s += W["acted_on"]; reasons.append("acted_on")
-    short_n = sum(1 for c in mine if len(c["body"].strip()) < SHORT_LEN and c["type"] != "review")
+    short_n = sum(1 for c in mine if c["type"] != "review" and is_nit(c["body"]))
     return {
         "number": pr["number"], "title": pr["title"], "author": pr["author"], "url": pr["url"],
         "merged_at": pr["merged_at"], "author_association": assoc, "acted_on": acted_on,
         "first_reviewer": first_reviewer, "mentored": bool(mentored),
-        "substantive": cnt["review_comment"] >= 1 or "CHANGES_REQUESTED" in states
-                       or any(c["type"] == "review" and len(c["body"].strip()) >= SHORT_LEN for c in mine),
+        "substantive": has_sub, "inline_substantive": cnt["inline_sub"],
         "review_comments": cnt["review_comment"], "issue_comments": cnt["issue_comment"],
         "reviews": cnt["review"], "review_states": sorted(st for st in states if st),
         "short_comments": short_n,
@@ -709,8 +749,8 @@ def analyze_repo(repo, users, since, until, with_commits=True):
     login = lambda r: (r.get("user") or {}).get("login")
 
     def is_sub(c, kind):
-        return kind == "review_comment" or c.get("state") == "CHANGES_REQUESTED" \
-            or (kind == "review" and len((c.get("body") or "").strip()) >= SHORT_LEN)
+        """別人的留言算不算實質意見（判斷受評者是不是第一個留實質意見的人）。和受評者用同一套標準。"""
+        return is_substantive(kind, c.get("body"))
 
     # 3. 每個 PR 抓一次留言，拆給每個有參與的人。回傳 {user: (mine, own_row, review_row, backport_kind)}
     def process_pr(pr):
@@ -737,7 +777,10 @@ def analyze_repo(repo, users, since, until, with_commits=True):
                 by_user.setdefault(u, []).append({
                     "pr": num, "pr_title": pr["title"], "type": kind,
                     "review_state": c.get("state") if kind == "review" else None,
-                    "date": c.get(tkey), "body": c.get("body") or "", "url": c.get("html_url")})
+                    "date": c.get(tkey), "body": c.get("body") or "", "url": c.get("html_url"),
+                    # 給 --dump 用：行內留言的檔案、行號、diff 片段
+                    "path": c.get("path"), "line": c.get("line") or c.get("original_line"),
+                    "hunk": c.get("diff_hunk") if kind == "review_comment" else None})
 
         out = {}
         backport = is_backport(pr["title"])
@@ -763,15 +806,22 @@ def analyze_repo(repo, users, since, until, with_commits=True):
                     pr["merged_by"] = (closed[-1].get("actor") or {}).get("login")
                     pr["merged_via_commit"] = True
 
+        # 給 --dump 用：每則留言帶上所屬 PR 的作者、身分、狀態
+        meta = {"pr_author": author, "pr_assoc": pr.get("author_association"), "pr_merged": pr["merged_at"],
+                "pr_state": pr["state"], "pr_url": pr["url"]}
+        for cs in by_user.values():
+            for c in cs:
+                c.update(meta)
+
         # 3a. review 別人的 PR
         for u, mine in by_user.items():
             if u == author:
                 continue
             if backport:
                 out[u] = (mine, None, None, "review"); continue
-            substantive = [c for c in mine if c["type"] == "review_comment"
-                           or c["review_state"] == "CHANGES_REQUESTED"
-                           or (c["type"] == "review" and len(c["body"].strip()) >= SHORT_LEN)]
+            # 實質意見：非 nit 的行內留言，或 40 字以上的結論。只有 nit 或沒文字的 request changes 不算，
+            # 所以也不會觸發 first_reviewer / acted_on
+            substantive = [c for c in mine if is_substantive(c["type"], c["body"])]
             acted = first_rv = False
             if substantive:
                 first = min(c["date"] for c in substantive)
@@ -846,12 +896,13 @@ def analyze_repo(repo, users, since, until, with_commits=True):
         scored, reviewed, comments = d["scored"], d["reviewed"], d["comments"]
         for r in scored: r["repo"] = repo
         for r in reviewed: r["repo"] = repo
+        for c in comments: c["repo"] = repo
         scored.sort(key=lambda x: -x["score"])
         reviewed.sort(key=lambda x: -x["score"])
         by_type = Counter(c["type"] for c in comments)
         results[u] = {
             "user": u, "repo": repo, "since": since, "until": until,
-            "commits": commits_by_user[u], "scored": scored, "reviewed": reviewed,
+            "commits": commits_by_user[u], "scored": scored, "reviewed": reviewed, "comments": comments,
             "comment_prs": len({c["pr"] for c in comments}),
             "issue_comments": by_type["issue_comment"], "review_comments": by_type["review_comment"],
             "reviews": by_type["review"], "comments_total": len(comments),
@@ -940,7 +991,7 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
         f"- 留言總數：{stats['comments_total']}",
         f"- Backport PR（不計分）：自己開的 {stats['backport_own']} 個、review 過的 {stats['backport_review']} 個",
         f"- Review 過的非 committer PR：{stats['reviewed_noncommitter']} 個（其中第一次貢獻者 {stats['reviewed_newcomer']} 個）",
-        f"- 帶非 committer（留 {MENTOR_MIN_INLINE} 則以上意見或 request changes、最後 merge）：{stats['mentored']} 個",
+        f"- 帶非 committer（留 {MENTOR_MIN_INLINE} 則以上非 nit 行內意見或 request changes、最後 merge）：{stats['mentored']} 個",
         f"- Review 後 PR 有更新（review 起作用）：{stats['reviewed_acted']} 個",
         f"- 第一個留實質意見的 PR：{stats['reviewed_first']} 個",
         f"- 深度 review（行內 {DEEP_REVIEW_INLINE} 則以上，每個 +{REVIEW_WEIGHTS['deep_review']:g}）：{m['deep_reviews']} 個"
@@ -958,7 +1009,7 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
     if reviewed:
         lines += ["", "Review 過的 PR 評分（由高到低）", ""]
         for r in reviewed:
-            detail = (f"行內 {r['review_comments']}、一般 {r['issue_comments']}、結論 {r['reviews']}"
+            detail = (f"行內 {r['review_comments']}（實質 {r.get('inline_substantive', 0)}）、一般 {r['issue_comments']}、結論 {r['reviews']}"
                       + (f"、{', '.join(r['score_reasons'])}" if r["score_reasons"] else ""))
             lines.append(f"- [{r['score']:+.2f}] {tag(r)}#{r['number']} {r['title']}　（{detail}）")
     return lines
@@ -975,6 +1026,68 @@ def combine(results):
     reviewed = sorted((r for res in results for r in res["reviewed"]), key=lambda x: -x["score"])
     stats = {k: sum(res[k] for res in results) for k in STAT_KEYS}
     return scored, reviewed, stats
+
+
+DUMP_HUNK_LINES = 8   # --dump 時每則行內留言附上 diff 片段的最後幾行（看留言針對的程式碼）
+
+
+def dump_user(path, user, repos, results, scored, reviewed, stats, m, since, until):
+    """把一個人的評分明細和區間內所有留言全文寫成一個 markdown 檔，給人或 LLM 看他在 PR 上的討論內容。
+    留言依 PR 分段（PR 依第一則留言的時間排序）、段內依時間排序；每段標明 PR 作者與身分、merge 狀態、該 PR 的計分。"""
+    comments = [c for res in results for c in res["comments"]]
+    own = {(r["repo"], r["number"]): r for r in scored}
+    rv = {(r["repo"], r["number"]): r for r in reviewed}
+    lines = [f"# {user}", f"區間：{since} ~ {until}；repo：{', '.join(repos)}", ""]
+    lines += summary_lines(scored, reviewed, stats, m, "## 評分", show_repo=len(results) > 1)
+
+    by_pr = {}
+    for c in comments:
+        by_pr.setdefault((c["repo"], c["pr"]), []).append(c)
+    n_short = sum(1 for c in comments if c["type"] != "review" and is_nit(c["body"]))
+    lines += ["", "## 留言全文", "",
+              f"{len(by_pr)} 個 PR、{len(comments)} 則（行內 {stats['review_comments']}、一般 {stats['issue_comments']}、"
+              f"review 結論 {stats['reviews']}；短留言或只挑格式的 nit {n_short} 則，標 [nit]）。"
+              f"行內留言附上 diff 片段的最後 {DUMP_HUNK_LINES} 行。", ""]
+    for (repo, num), cs in sorted(by_pr.items(), key=lambda kv: min(c["date"] or "" for c in kv[1])):
+        cs.sort(key=lambda c: c["date"] or "")
+        c0 = cs[0]
+        who = "本人開的 PR" if c0["pr_author"] == user else f"作者 {c0['pr_author']}（{c0['pr_assoc'] or 'NONE'}）"
+        state = "已 merge" if c0["pr_merged"] else ("還開著" if c0["pr_state"] == "open" else "已關閉")
+        if (repo, num) in rv:
+            r = rv[(repo, num)]
+            sc = f"review 分 {r['score']:+.2f}" + (f"（{', '.join(r['score_reasons'])}）" if r["score_reasons"] else "")
+        elif (repo, num) in own:
+            r = own[(repo, num)]
+            sc = f"重要性 {r['score']:+g} → 計入 {r['counted']:+g}（{', '.join(r['score_reasons']) or '無加減分'}）"
+        elif is_backport(c0["pr_title"]):
+            sc = "backport，不計分"
+        else:
+            sc = "不計分"
+        lines += [f"### {repo}#{num} {c0['pr_title']}", c0["pr_url"], f"{who}；{state}；{sc}", ""]
+        for c in cs:
+            when = (c["date"] or "")[:16].replace("T", " ")
+            body = c["body"].replace("\r\n", "\n").strip()
+            if c["type"] == "review":
+                label = f"review {c['review_state'] or ''}".strip()
+                if not body:
+                    lines.append(f"- {when} [{label}]（無文字）")
+                    continue
+            elif c["type"] == "review_comment":
+                label = f"行內 {c['path']}" + (f":{c['line']}" if c["line"] else "")
+            else:
+                label = "一般留言"
+            if c["type"] != "review" and is_nit(body):
+                label += "] [nit"
+            lines.append(f"- {when} [{label}]")
+            if c.get("hunk"):
+                lines.append("  ```diff")
+                lines += ["  " + l for l in c["hunk"].splitlines()[-DUMP_HUNK_LINES:]]
+                lines.append("  ```")
+            lines += ["  " + l for l in body.splitlines()]
+            lines.append("")
+        lines.append("")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def fmt(v, digits=2):
@@ -1002,6 +1115,8 @@ def main():
     ap.add_argument("--detail", action="store_true", help="總表之後再印每個人的明細（預設只印總表）")
     ap.add_argument("--format", choices=["text", "markdown"], default="text",
                     help="輸出格式：text（預設，terminal / Jenkins console 好讀）或 markdown")
+    ap.add_argument("--dump", metavar="DIR",
+                    help="另外替每個人寫一個 DIR/<帳號>.md：評分明細加上區間內所有留言全文（含行內留言的 diff 片段）")
     ap.add_argument("--no-cache", action="store_true", help="不使用快取（ETag 和每個 PR 的原始資料都不用）")
     ap.add_argument("--cache-dir", help="快取目錄，預設 ~/.cache/gh_activity")
     a = ap.parse_args()
@@ -1092,6 +1207,13 @@ def main():
         if m["main_repo_total"] <= 0:
             m["main_repo"] = None   # 完全沒活動，不要顯示成第一個 repo
         rows.append((p, m, results, scored, reviewed, stats))
+
+    if a.dump:
+        os.makedirs(a.dump, exist_ok=True)
+        for p, m, results, scored, reviewed, stats in rows:
+            dump_user(os.path.join(a.dump, f"{p['user']}.md"), p["user"], p["repos"],
+                      results, scored, reviewed, stats, m, since, until)
+        print(f"已替 {len(rows)} 個人各寫一個留言全文檔到 {a.dump}/<帳號>.md", file=sys.stderr)
 
     # 單人單 repo：維持原本的輸出格式
     if len(rows) == 1 and len(rows[0][2]) == 1:
