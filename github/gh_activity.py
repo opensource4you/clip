@@ -36,6 +36,7 @@ people.json 格式（每個人都查全部 repo）：
 未達的打折；沒 merge 的 PR 先算 1/4，被關掉的不計。
 Review 分只把「實質意見」當成有在認真 review 的證據：非 nit 的行內留言，或 40 字以上的結論。短留言和只挑格式的
 nit（nit: 開頭、行尾空白、換行、typo、縮排，見 is_nit）深度分打折，而且不觸發 request changes、首評、帶非 committer 的加分。
+整個 PR 都沒有實質意見的 approve（純蓋章）只拿 approve_only 的一點分，不拿 approved_merged。
 
 多 repo 的合併規則：總分各 repo 相加；品質分把該人所有 repo 的 PR 放在一起取前 N。
 """
@@ -69,9 +70,10 @@ WEIGHTS = {
 # 總分 = review 分 + 重要 PR 分 + 一般 PR 分
 # 目標排序：review ≈ 重要貢獻 > 一般貢獻。大致的單位分數：
 #   實質 review（幾則行內意見、approve 且 merge）≈ 4～6，深度 review（行內 ≥ DEEP_REVIEW_INLINE）≈ 8～10，
-#   帶非 committer 再 +8；只按 approve 的 review ≈ 1
+#   帶非 committer 再 +8；只按 approve 的 review（沒留實質意見，含只寫 LGTM）= REVIEW_WEIGHTS["approve_only"] ≈ 0.3
 #   重要 PR（prod code、有討論、有規模）≈ 4～8；一般 PR 乘 0.5 ≈ 0.5～1.5
-#   也就是：帶一個非 committer 的 PR 到 merge ≈ 兩個重要 PR；深度 review ≈ 重要 PR；純 approve 幾乎不計
+#   也就是：帶一個非 committer 的 PR 到 merge ≈ 兩個重要 PR；深度 review ≈ 重要 PR；純 approve 有分但很少，
+#   蓋 10 個章 ≈ 一個有實質意見的 review
 IMPORTANT_PR_MIN = 4.0     # PR 重要性分數達此值算「重要貢獻」。約等於 prod code 且（3 則討論 + 300 行，或 5 則討論 + 50 行）
 PR_BUCKET_FACTOR = {"important": 1.0, "general": 0.5}
 PR_STATE_FACTOR = {
@@ -92,14 +94,17 @@ REVIEW_BREADTH = {
 # 樣本不足 N 個時，缺的名額用基準值補（拉向一般水準，不當 0 也不當高估）。
 # 多人模式的基準值是全體受評者的中位數；單人模式用這裡的固定值。
 BASELINE_PR_DEFAULT = 1.0      # 一個普通的 production code PR
-BASELINE_REVIEW_DEFAULT = 1.0  # 一個純 approve 且 merge 的 review（= REVIEW_WEIGHTS["approved_merged"]）
+BASELINE_REVIEW_DEFAULT = 1.0  # 約一個有實質意見且 approve、merge 的最低分 review（= REVIEW_WEIGHTS["approved_merged"]）
 
 # ---- Review 活動的權重（只算別人開的 PR）------------------------------------
 REVIEW_WEIGHTS = {
     "review_comment": 1.0,      # 程式碼行內留言，每則
     "issue_comment": 0.5,       # PR 下方一般留言，每則
     "review_body": 1.0,         # 有文字內容的 review 結論，每則
-    "approved_merged": 1.0,     # 給了 approve 且 PR 後來有 merge（每個 PR 一次）。原 2.0；降低是為了讓純 approve 不值錢，實質意見才有分
+    "approved_merged": 1.0,     # 給了 approve 且 PR 後來有 merge，而且在這個 PR 上有留實質意見（每個 PR 一次）。原 2.0
+    "approve_only": 0.3,        # 純蓋章：approve 且 merge，但整個 PR 沒有任何實質意見（沒文字、只寫 LGTM、或只有 nit）。
+                                # 取代 approved_merged，不疊加。給一點分是因為 approve 也要讀 code、也要擔責任，
+                                # 但壓到 approved_merged 的 1/3 以下，讓蓋章衝不出量
     "changes_requested": 2.0,   # 給過 request changes，且在這個 PR 上至少有一則實質意見（每個 PR 一次）。只為 nit 按 request changes 不加分
     "short_factor": 0.25,       # 短留言（少於 SHORT_LEN 字，LGTM、+1 之類）和只挑格式的 nit（見 is_nit）打折
     # 留言累加後取對數再乘 comment_log_scale：1.5 × log2(1 + 累加值)。
@@ -108,7 +113,8 @@ REVIEW_WEIGHTS = {
     "comment_log_scale": 1.5,
     "first_reviewer": 1.0,      # 這個 PR 上第一個留下實質意見的人（非 nit 的行內意見或 40 字以上結論；純 approve、只有 nit、沒文字的 request changes 都不算）
     "acted_on": 1.0,            # 留下實質意見後 PR 有再 push 新 commit（可能是 review 起了作用，訊號不確定所以分數低，每個 PR 一次）
-    "mentored": 8.0,            # 帶非 committer：作者不是 committer、本人留 MENTOR_MIN_INLINE 則以上非 nit 的行內意見或（有實質意見的）request changes、PR 最後 merge。原 4.0
+    "mentored": 8.0,            # 帶非 committer：作者不是 committer、本人留 MENTOR_MIN_INLINE 則以上非 nit 的行內意見、PR 最後 merge。原 4.0
+                                # 原本 request changes 也能單獨觸發，但一句「fix lint」的 request changes 就拿 +8 太鬆，已拿掉
     "deep_review": 3.0,         # 深度 review：行內留言達 DEEP_REVIEW_INLINE 則（每個 PR 一次）。留言的對數分壓得很扁，這裡把深度拉開
     "newcomer_factor": 1.5,     # 作者是第一次貢獻者或沒有關聯的人，留言深度的部分乘上這個倍數（固定加分不乘）
     "contributor_factor": 1.2,  # 作者是非 committer 的貢獻者
@@ -451,7 +457,8 @@ def score(pr):
 
 def review_score(pr, mine, acted_on=False, first_reviewer=False):
     """mine 是本人在這個（別人開的）PR 上的留言，回傳該 PR 的 review 分數。
-    分數 = 留言深度（對數、非 committer 倍率）＋ 固定加分（approve 且 merge、request changes、首評、深度 review、帶非 committer、起作用）。"""
+    分數 = 留言深度（對數、非 committer 倍率）＋ 固定加分（approve 且 merge、request changes、首評、深度 review、帶非 committer、起作用）。
+    沒有實質意見的 approve 只拿 approve_only（純蓋章分），不拿 approved_merged。"""
     W = REVIEW_WEIGHTS
     depth, cnt = 0.0, Counter()
     for c in mine:
@@ -464,8 +471,10 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
             depth += W["issue_comment"] * factor; cnt["issue_comment"] += 1
         elif c["type"] == "review":
             cnt["review"] += 1
-            if c["body"].strip():
-                depth += W["review_body"] * factor
+            # 短結論（LGTM、+1、Thanks）不算深度：approve 本身的分已由 approve_only / approved_merged 給，
+            # 否則「LGTM + approve」會比「沒文字的 approve」多半分，兩者實際上是同一件事
+            if c["body"].strip() and not is_nit(c["body"]):
+                depth += W["review_body"]
             if is_substantive("review", c["body"]):
                 cnt["review_sub"] += 1
     if W["comment_log"] and depth > 0:
@@ -482,7 +491,10 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
         depth *= W["contributor_factor"]; reasons.append(f"contributor×{W['contributor_factor']}")
     s = depth
     if "APPROVED" in states and pr["merged_at"]:
-        s += W["approved_merged"]; reasons.append("approved_merged")
+        if has_sub:
+            s += W["approved_merged"]; reasons.append("approved_merged")
+        else:
+            s += W["approve_only"]; reasons.append("approve_only")
     changes_requested = "CHANGES_REQUESTED" in states and has_sub
     if changes_requested:
         s += W["changes_requested"]; reasons.append("changes_requested")
@@ -493,8 +505,10 @@ def review_score(pr, mine, acted_on=False, first_reviewer=False):
     deep = cnt["review_comment"] >= DEEP_REVIEW_INLINE
     if deep:
         s += W["deep_review"]; reasons.append("deep_review")
+    # 帶非 committer：要有 MENTOR_MIN_INLINE 則以上實質行內意見才算。原本「或 request changes」會讓
+    # 一句「please fix lint」的 request changes 也拿到 +8，所以改成 request changes 只是附帶條件，不能單獨觸發
     mentored = (assoc in NON_COMMITTER and pr["merged_at"]
-                and (cnt["inline_sub"] >= MENTOR_MIN_INLINE or changes_requested))
+                and cnt["inline_sub"] >= MENTOR_MIN_INLINE)
     if mentored:
         s += W["mentored"]; reasons.append("mentored")
     if acted_on:
@@ -991,7 +1005,7 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
         f"- 留言總數：{stats['comments_total']}",
         f"- Backport PR（不計分）：自己開的 {stats['backport_own']} 個、review 過的 {stats['backport_review']} 個",
         f"- Review 過的非 committer PR：{stats['reviewed_noncommitter']} 個（其中第一次貢獻者 {stats['reviewed_newcomer']} 個）",
-        f"- 帶非 committer（留 {MENTOR_MIN_INLINE} 則以上非 nit 行內意見或 request changes、最後 merge）：{stats['mentored']} 個",
+        f"- 帶非 committer（留 {MENTOR_MIN_INLINE} 則以上非 nit 行內意見、最後 merge）：{stats['mentored']} 個",
         f"- Review 後 PR 有更新（review 起作用）：{stats['reviewed_acted']} 個",
         f"- 第一個留實質意見的 PR：{stats['reviewed_first']} 個",
         f"- 深度 review（行內 {DEEP_REVIEW_INLINE} 則以上，每個 +{REVIEW_WEIGHTS['deep_review']:g}）：{m['deep_reviews']} 個"
