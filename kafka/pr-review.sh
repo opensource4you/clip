@@ -4,6 +4,7 @@
 # ONE markdown bundle for review:
 #   PR metadata + description, full discussion (comments, reviews, inline review
 #   threads), commit list, stat, full diff, and full contents of modified files.
+#   Nothing in the bundle is truncated.
 #
 # Usage:
 #   pr-review.sh <pr-number> [base-branch]      # base-branch defaults to trunk
@@ -12,7 +13,6 @@
 #   REPO_DIR      default $HOME/project/kafka (local clone to operate on)
 #   UPSTREAM      default https://github.com/apache/kafka
 #   OUT_DIR       default $HOME/pr-review
-#   MAX_LINES     default 3000 (per-file cap in the "full files" section)
 #   GITHUB_TOKEN  optional; falls back to `gh auth token`. Without a token the
 #                 GitHub API allows 60 requests/hour, which is enough for a few PRs.
 #
@@ -27,7 +27,6 @@ PR_NUMBER="${1:?usage: $(basename "$0") <pr-number> [base-branch]}"
 MAIN="${2:-${MAIN:-trunk}}"
 UPSTREAM="${UPSTREAM:-https://github.com/apache/kafka}"
 OUT_DIR="${OUT_DIR:-$HOME/pr-review}"
-MAX_LINES="${MAX_LINES:-3000}"
 
 REPO_SLUG="$(printf '%s' "$UPSTREAM" | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##; s#/$##')"
 GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || true)}"
@@ -169,13 +168,11 @@ for ts, kind, obj in events:
         line = root.get("line") or root.get("original_line")
         outdated = " (outdated)" if root.get("line") is None else ""
         print(f"### Inline thread: `{root['path']}` line {line}{outdated} ({ts})\n")
-        hunk = (root.get("diff_hunk") or "").splitlines()
+        hunk = (root.get("diff_hunk") or "").rstrip("\n")
         if hunk:
-            if len(hunk) > 12:
-                hunk = ["..."] + hunk[-12:]
-            print("```diff")
-            print("\n".join(hunk))
-            print("```")
+            print("````diff")
+            print(hunk)
+            print("````")
             print()
         for c in obj:
             print(f"**{c['user']['login']}** ({c['created_at']}):\n")
@@ -225,7 +222,8 @@ echo "==> Writing $BUNDLE"
   echo "## Changed files"
   echo
   echo '```'
-  git diff HEAD -M --stat=120
+  # Wide enough that git never abbreviates long paths with "...".
+  git diff HEAD -M --stat=10000
   echo '```'
   echo
   echo "## Diff"
@@ -236,7 +234,7 @@ echo "==> Writing $BUNDLE"
   echo
   echo "## Full contents of modified files (post-merge)"
   echo
-  echo "_Added files are omitted here since the diff already contains them in full. Deleted and binary files are omitted. Files longer than $MAX_LINES lines are truncated._"
+  echo "_Added files are omitted here since the diff already contains them in full. Deleted and binary files are omitted. All other files are included in full._"
   echo
   git diff HEAD -M --name-status | while IFS=$'\t' read -r st p1 p2; do
     code="${st:0:1}"
@@ -248,13 +246,9 @@ echo "==> Writing $BUNDLE"
     echo "### $path ($total lines)"
     echo
     echo "\`\`\`\`$(lang_of "$path")"
-    if [ "$total" -gt "$MAX_LINES" ]; then
-      head -n "$MAX_LINES" "$path"
-      echo
-      echo "... [truncated at $MAX_LINES of $total lines; set MAX_LINES to raise]"
-    else
-      cat "$path"
-    fi
+    cat "$path"
+    # Close the fence on its own line even if the file has no trailing newline.
+    [ -z "$(tail -c 1 "$path")" ] || echo
     echo '````'
     echo
   done
