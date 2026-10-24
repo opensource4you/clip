@@ -15,6 +15,7 @@ stderr 會印每個階段的秒數、請求數、304 命中數和等待額度的
   python gh_activity.py --config people.json --since 2026-01-01 --until 2026-09-17
   python gh_activity.py --config people.json --dump out/                  # 另外替每個人寫一個 out/<帳號>.md：
                                                                            # 評分明細 + 區間內所有留言全文（含行內留言的 diff 片段）
+                                                                           # + 本人開的 PR 的描述全文
 
 people.json 格式（每個人都查全部 repo）：
   {
@@ -349,9 +350,10 @@ def graphql(query, variables):
         raise RuntimeError(f"GraphQL HTTP {status}: {body[:200]!r}")
 
 
-# 搜尋結果只取後面會用到的欄位。不抓 labels：它會讓每頁成本從 1 點變 11 點，而且目前沒有用到
+# 搜尋結果只取後面會用到的欄位。不抓 labels：它會讓每頁成本從 1 點變 11 點，而且目前沒有用到。
+# body（PR 描述）給 --dump 用，不會增加點數（點數只看節點數）
 SEARCH_FIELDS = """issueCount pageInfo { hasNextPage endCursor }
-    nodes { ... on PullRequest { number title url state createdAt updatedAt mergedAt authorAssociation
+    nodes { ... on PullRequest { number title body url state createdAt updatedAt mergedAt authorAssociation
                                  author { login } comments { totalCount } } }"""
 
 
@@ -677,7 +679,7 @@ def search_prs(repo, since, users):
                 found.setdefault(i["number"], i)
     prs = [{"number": i["number"], "title": i["title"], "author": (i.get("author") or {}).get("login") or "ghost",
             "state": i["state"].lower(), "created_at": i["createdAt"], "updated_at": i["updatedAt"],
-            "url": i["url"], "merged_at": i.get("mergedAt"),
+            "url": i["url"], "merged_at": i.get("mergedAt"), "body": i.get("body") or "",
             "n_issue_comments": i["comments"]["totalCount"], "author_association": i.get("authorAssociation")}
            for i in found.values()]
     return prs, n_queries
@@ -832,7 +834,7 @@ def analyze_repo(repo, users, since, until, with_commits=True):
             if u == author:
                 continue
             if backport:
-                out[u] = (mine, None, None, "review"); continue
+                out[u] = (mine, None, None, "review", None); continue
             # 實質意見：非 nit 的行內留言，或 40 字以上的結論。只有 nit 或沒文字的 request changes 不算，
             # 所以也不會觸發 first_reviewer / acted_on
             substantive = [c for c in mine if is_substantive(c["type"], c["body"])]
@@ -846,15 +848,19 @@ def analyze_repo(repo, users, since, until, with_commits=True):
                                 for c in rows
                                 if login(c) not in (u, author) and not is_bot(login(c)) and is_sub(c, kind)]
                 first_rv = not others_first or first < min(others_first)
-            out[u] = (mine, None, review_score(pr, mine, acted, first_rv), None)
+            out[u] = (mine, None, review_score(pr, mine, acted, first_rv), None, None)
 
         # 3b. 受評者自己開的 PR
         if author in user_set:
             mine = by_user.get(author, [])
+            # 給 --dump 用：本人開的 PR 一律帶出描述，即使自己沒在上面留言、或不計分
+            own_meta = {"pr": num, "pr_title": pr["title"], "pr_url": pr["url"], "pr_body": pr.get("body") or "",
+                        "created_at": pr["created_at"], "pr_author": author, "pr_assoc": pr.get("author_association"),
+                        "pr_merged": pr["merged_at"], "pr_state": pr["state"]}
             if backport:
-                out[author] = (mine, None, None, "own")
+                out[author] = (mine, None, None, "own", own_meta)
             elif not in_range(pr["created_at"], since, until):
-                out[author] = (mine, None, None, None)
+                out[author] = (mine, None, None, None, own_meta)
             else:
                 detail = cache.get("detail", lambda: get(f"{API}/repos/{repo}/pulls/{num}")[0])
                 files = cache.get("files", lambda: get_all(f"{API}/repos/{repo}/pulls/{num}/files"))
@@ -878,20 +884,21 @@ def analyze_repo(repo, users, since, until, with_commits=True):
                     "max_review_rounds": max(reviewers.values(), default=0),
                 }
                 score(row)
-                out[author] = (mine, row, None, None)
+                out[author] = (mine, row, None, None, own_meta)
         cache.save()
         return out
 
-    per_user = {u: {"comments": [], "scored": [], "reviewed": [], "backports": Counter()} for u in users}
+    per_user = {u: {"comments": [], "scored": [], "reviewed": [], "own_prs": [], "backports": Counter()} for u in users}
     print(f"下載 {len(prs)} 個 PR 的留言（{WORKERS} 個 thread）...", file=sys.stderr)
     t0, s0 = time.time(), _snapshot()
     pool = ThreadPoolExecutor(max_workers=WORKERS)
     try:
         futures = [pool.submit(process_pr, pr) for pr in prs]
         for n, fut in enumerate(as_completed(futures), 1):
-            for u, (mine, row, rv, bp) in fut.result().items():
+            for u, (mine, row, rv, bp, own_meta) in fut.result().items():
                 d = per_user[u]
                 d["comments"].extend(mine)
+                if own_meta: d["own_prs"].append(own_meta)
                 if bp: d["backports"][bp] += 1
                 if row: d["scored"].append(row)
                 if rv: d["reviewed"].append(rv)
@@ -911,6 +918,7 @@ def analyze_repo(repo, users, since, until, with_commits=True):
         for r in scored: r["repo"] = repo
         for r in reviewed: r["repo"] = repo
         for c in comments: c["repo"] = repo
+        for o in d["own_prs"]: o["repo"] = repo
         scored.sort(key=lambda x: -x["score"])
         reviewed.sort(key=lambda x: -x["score"])
         by_type = Counter(c["type"] for c in comments)
@@ -926,6 +934,7 @@ def analyze_repo(repo, users, since, until, with_commits=True):
             "reviewed_first": sum(1 for r in reviewed if r["first_reviewer"]),
             "reviewed_noncommitter": sum(1 for r in reviewed if r["author_association"] in NON_COMMITTER),
             "mentored": sum(1 for r in reviewed if r["mentored"]),
+            "own_prs": d["own_prs"],
         }
     return results
 
@@ -1047,24 +1056,35 @@ DUMP_HUNK_LINES = 8   # --dump 時每則行內留言附上 diff 片段的最後�
 
 def dump_user(path, user, repos, results, scored, reviewed, stats, m, since, until):
     """把一個人的評分明細和區間內所有留言全文寫成一個 markdown 檔，給人或 LLM 看他在 PR 上的討論內容。
-    留言依 PR 分段（PR 依第一則留言的時間排序）、段內依時間排序；每段標明 PR 作者與身分、merge 狀態、該 PR 的計分。"""
+    留言依 PR 分段（PR 依第一則留言的時間排序）、段內依時間排序；每段標明 PR 作者與身分、merge 狀態、該 PR 的計分。
+    本人開的 PR 一律列出（即使自己沒留言），並附上 PR 描述全文。"""
     comments = [c for res in results for c in res["comments"]]
     own = {(r["repo"], r["number"]): r for r in scored}
     rv = {(r["repo"], r["number"]): r for r in reviewed}
     lines = [f"# {user}", f"區間：{since} ~ {until}；repo：{', '.join(repos)}", ""]
     lines += summary_lines(scored, reviewed, stats, m, "## 評分", show_repo=len(results) > 1)
 
-    by_pr = {}
+    own_prs = {(o["repo"], o["pr"]): o for res in results for o in res.get("own_prs", [])}
+    by_pr = {key: [] for key in own_prs}
     for c in comments:
         by_pr.setdefault((c["repo"], c["pr"]), []).append(c)
     n_short = sum(1 for c in comments if c["type"] != "review" and is_nit(c["body"]))
     lines += ["", "## 留言全文", "",
-              f"{len(by_pr)} 個 PR、{len(comments)} 則（行內 {stats['review_comments']}、一般 {stats['issue_comments']}、"
+              f"{len(by_pr)} 個 PR（其中本人開的 {len(own_prs)} 個，附 PR 描述）、{len(comments)} 則留言"
+              f"（行內 {stats['review_comments']}、一般 {stats['issue_comments']}、"
               f"review 結論 {stats['reviews']}；短留言或只挑格式的 nit {n_short} 則，標 [nit]）。"
               f"行內留言附上 diff 片段的最後 {DUMP_HUNK_LINES} 行。", ""]
-    for (repo, num), cs in sorted(by_pr.items(), key=lambda kv: min(c["date"] or "" for c in kv[1])):
+
+    def first_seen(key):
+        cs = by_pr[key]
+        if cs:
+            return min(c["date"] or "" for c in cs)
+        return own_prs[key]["created_at"] or ""
+
+    for (repo, num) in sorted(by_pr, key=first_seen):
+        cs = by_pr[(repo, num)]
         cs.sort(key=lambda c: c["date"] or "")
-        c0 = cs[0]
+        c0 = cs[0] if cs else own_prs[(repo, num)]
         who = "本人開的 PR" if c0["pr_author"] == user else f"作者 {c0['pr_author']}（{c0['pr_assoc'] or 'NONE'}）"
         state = "已 merge" if c0["pr_merged"] else ("還開著" if c0["pr_state"] == "open" else "已關閉")
         if (repo, num) in rv:
@@ -1078,6 +1098,16 @@ def dump_user(path, user, repos, results, scored, reviewed, stats, m, since, unt
         else:
             sc = "不計分"
         lines += [f"### {repo}#{num} {c0['pr_title']}", c0["pr_url"], f"{who}；{state}；{sc}", ""]
+        if (repo, num) in own_prs:
+            o = own_prs[(repo, num)]
+            desc = o["pr_body"].replace("\r\n", "\n").strip()
+            when = (o["created_at"] or "")[:16].replace("T", " ")
+            if desc:
+                lines.append(f"- {when} [PR 描述]（{len(desc)} 字）")
+                lines += ["  " + l for l in desc.splitlines()]
+            else:
+                lines.append(f"- {when} [PR 描述]（無文字）")
+            lines.append("")
         for c in cs:
             when = (c["date"] or "")[:16].replace("T", " ")
             body = c["body"].replace("\r\n", "\n").strip()
@@ -1130,7 +1160,7 @@ def main():
     ap.add_argument("--format", choices=["text", "markdown"], default="text",
                     help="輸出格式：text（預設，terminal / Jenkins console 好讀）或 markdown")
     ap.add_argument("--dump", metavar="DIR",
-                    help="另外替每個人寫一個 DIR/<帳號>.md：評分明細加上區間內所有留言全文（含行內留言的 diff 片段）")
+                    help="另外替每個人寫一個 DIR/<帳號>.md：評分明細、區間內所有留言全文（含行內留言的 diff 片段）、本人開的 PR 的描述")
     ap.add_argument("--no-cache", action="store_true", help="不使用快取（ETag 和每個 PR 的原始資料都不用）")
     ap.add_argument("--cache-dir", help="快取目錄，預設 ~/.cache/gh_activity")
     a = ap.parse_args()
