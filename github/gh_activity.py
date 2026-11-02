@@ -21,18 +21,28 @@ people.json 格式（每個人都查全部 repo）：
   {
     "since": "2026-08-03",            # 可省略
     "until": "2026-09-17",            # 可省略
-    "users": ["jason810496", "chia7712"],
-    "repos": ["apache/airflow", "apache/kafka"]
+    "users": ["jason810496", "chia7712", {"user": "mjsax", "jira": "mjsax"}],   # JIRA 帳號和 GitHub 不同時才要填 jira
+    "repos": ["apache/airflow", "apache/kafka"],
+    "jira": {"apache/kafka": "KAFKA"},  # 可省略：哪些 repo 的題目在 JIRA、project key 是什麼。沒填就從 commit 訊息自動判斷
+    "jira_url": "https://issues.apache.org/jira"   # 可省略，預設 ASF JIRA
   }
   舊格式（每個人各自列 repo）也接受：{"people": [{"user": "...", "repos": [...]}]}
+
+出題分：本人開的 issue（GitHub issue 或 JIRA 單子）在區間內被「別人」的 PR 關掉且 merge，算一個「出題被接走」。
+只算這種，不算開了幾個 issue：開 issue 零成本，但被別人接走做完是真的出題給社群。
+  - GitHub issue：用 PR 的 closingIssuesReferences（PR 描述裡的 Closes #N 或手動 link），開題人是 issue 的 author。
+  - JIRA：從 PR 標題的 KAFKA-12345 這類 key 反查 JIRA 的 reporter。reporter 的 JIRA 帳號和 GitHub login
+    完全相同（不分大小寫）才對得上，對不上的 reporter 會在 stderr 列出來，需要的話在 users 裡填 jira 欄位對應。
+  - 接走的人是非 committer 再加分；描述字數預設不設門檻（ISSUE_WEIGHTS["min_desc"] = 0，要擋空殼題目再調）；
+    同一個 PR 本人已經拿到 mentored（帶非 committer）就不重複給出題分。
 
 搜尋是一個 repo 一次搜一批人（重複的 author: 是「或」），每個 PR 的留言只抓一次再拆給有參與的人，
 所以人數多的時候比一個人一個 repo 分開跑省很多搜尋額度。
 搜尋走 GraphQL：REST 的搜尋每分鐘只有 30 次，GraphQL 走每小時 5000 點的額度（一頁約 1 點），
 而且一個請求可以用 alias 塞 SEARCHES_PER_REQUEST 個搜尋。其他資料（留言、reviews、files）仍走 REST，有 ETag 快取。
 
-總分 = review 分 + 重要 PR 分 + 一般 PR 分，目標排序是
-  review ≈ 重要貢獻 > 一般貢獻
+總分 = review 分 + 出題分 + 重要 PR 分 + 一般 PR 分，目標排序是
+  review ≈ 重要貢獻 > 一般貢獻；出題被接走一個約等於半個實質 review
 一個 PR 先算「重要性」分數（有沒有 production code、討論多深、改動多大），達 IMPORTANT_PR_MIN 的全額計入，
 未達的打折；沒 merge 的 PR 先算 1/4，被關掉的不計。
 Review 分只把「實質意見」當成有在認真 review 的證據：非 nit 的行內留言，或 40 字以上的結論。短留言和只挑格式的
@@ -120,6 +130,18 @@ REVIEW_WEIGHTS = {
     "newcomer_factor": 1.5,     # 作者是第一次貢獻者或沒有關聯的人，留言深度的部分乘上這個倍數（固定加分不乘）
     "contributor_factor": 1.2,  # 作者是非 committer 的貢獻者
 }
+# ---- 出題的權重（本人開的 issue / JIRA 被別人的 PR 關掉且 merge）----------------
+# 每個 issue 線性累加，不取對數：出 10 個題目都被人做完是真的工作量，而且每一個都要有人願意做、有 committer 願意 merge，
+# 灌不出來。單位分數：committer 接走 2、非 committer 接走 3；帶一個非 committer 到 merge（mentored 8）≈ 出 3 個題目
+ISSUE_WEIGHTS = {
+    "handed_off": 2.0,      # 本人開的題目被別人的 PR 關掉且 merge（每個 issue 一次，同一個 issue 被多個 PR 關只算第一個）
+    "noncommitter": 1.0,    # 接走的人是非 committer，再加
+    "min_desc": 0,          # issue 描述至少這麼多字才計分；0 表示不設門檻。把關的是「有人願意做、committer 願意 merge」，
+                            # 描述長短不是重點，一句話講清楚的也是好題目
+}
+ISSUE_KEY = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(\d+)\b")   # KAFKA-12345、YUNIKORN-3000
+DEFAULT_JIRA_URL = "https://issues.apache.org/jira"
+JIRA_DETECT_RATIO = 0.2     # 區間內 commit 訊息有這個比例以上帶同一個 project key，就當這個 repo 的題目在 JIRA
 NEWCOMER = {"FIRST_TIME_CONTRIBUTOR", "FIRST_TIMER", "NONE"}
 NON_COMMITTER = NEWCOMER | {"CONTRIBUTOR"}
 MENTOR_MIN_INLINE = 3
@@ -357,10 +379,18 @@ SEARCH_FIELDS = """issueCount pageInfo { hasNextPage endCursor }
                                  author { login } comments { totalCount } } }"""
 
 
-def _search_batch(batch):
+# 出題用的搜尋：區間內所有 merged PR，帶 GitHub 自己認得的「這個 PR 關掉哪些 issue」（Closes #N 或手動 link）。
+# closingIssuesReferences 是巢狀連線，每頁點數會多幾點，但省掉每個 PR 查 timeline 的 REST 請求
+SEARCH_FIELDS_MERGED = """issueCount pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { number title url mergedAt closedAt authorAssociation author { login }
+                                 closingIssuesReferences(first: 10) {
+                                     nodes { number title url createdAt body author { login } } } } }"""
+
+
+def _search_batch(batch, fields=SEARCH_FIELDS):
     """batch 是 [(搜尋字串, cursor)]，一個 GraphQL 請求送完，回傳 [(搜尋字串, 該頁結果)]。"""
     decl = ", ".join(f"$q{i}: String!, $c{i}: String" for i in range(len(batch)))
-    parts = " ".join(f"s{i}: search(query: $q{i}, type: ISSUE, first: 100, after: $c{i}) {{ {SEARCH_FIELDS} }}"
+    parts = " ".join(f"s{i}: search(query: $q{i}, type: ISSUE, first: 100, after: $c{i}) {{ {fields} }}"
                      for i in range(len(batch)))
     variables = {}
     for i, (q, cursor) in enumerate(batch):
@@ -369,7 +399,7 @@ def _search_batch(batch):
     return [(q, data[f"s{i}"]) for i, (q, _) in enumerate(batch)]
 
 
-def search_many(queries):
+def search_many(queries, fields=SEARCH_FIELDS):
     """一次送多個搜尋字串：每 SEARCHES_PER_REQUEST 個塞成一個 GraphQL 請求（alias），
     最多 SEARCH_WORKERS 個請求同時送，各自翻頁到完。
     回傳 {搜尋字串: (items, issueCount)}。issueCount 是真正的總數，超過 1000 表示結果被截斷。"""
@@ -379,7 +409,7 @@ def search_many(queries):
         todo = list(pending.items())
         batches = [todo[i:i + SEARCHES_PER_REQUEST] for i in range(0, len(todo), SEARCHES_PER_REQUEST)]
         with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as pool:
-            pages = [p for out in pool.map(_search_batch, batches) for p in out]
+            pages = [p for out in pool.map(lambda b: _search_batch(b, fields), batches) for p in out]
         for q, r in pages:
             items, _ = results[q]
             items.extend(n for n in r["nodes"] if n)   # is:pr 之外的 node 會是空物件
@@ -696,6 +726,204 @@ def verify_or_semantics(repo, since, users):
         sys.exit("GitHub 搜尋對重複的 author: 不是「或」的語意，無法批次搜尋。請回報這個問題。")
 
 
+def search_date_range(make_query, since, until, fields):
+    """make_query(since, until) 回傳一個帶日期區間的搜尋字串。撞到 1000 筆上限的區間對半拆開重搜，
+    合併所有結果（依 number 去重）。給「區間內所有 merged PR」這種人數無關、只能用日期切的搜尋用。"""
+    found, todo, n_queries = {}, [(since, until)], 0
+    while todo:
+        qs = {make_query(s, u): (s, u) for s, u in todo}
+        n_queries += len(qs)
+        todo = []
+        for q, (items, total) in search_many(list(qs), fields).items():
+            s, u = qs[q]
+            if total > 1000 and s < u:
+                d0, d1 = datetime.strptime(s, "%Y-%m-%d"), datetime.strptime(u, "%Y-%m-%d")
+                mid = d0 + (d1 - d0) / 2
+                todo += [(s, mid.strftime("%Y-%m-%d")), ((mid + timedelta(days=1)).strftime("%Y-%m-%d"), u)]
+                continue
+            if total > 1000:
+                print(f"  警告：{q} 單日超過 1000 筆，結果被截斷", file=sys.stderr)
+            for i in items:
+                found.setdefault(i["number"], i)
+    return list(found.values()), n_queries
+
+
+def detect_jira_project(commits):
+    """從區間內的 commit 訊息判斷這個 repo 的題目是不是在 JIRA：第一行帶 KAFKA-12345 這類 key 的比例
+    達 JIRA_DETECT_RATIO 就回傳那個 project key，否則 None。"""
+    cnt = Counter()
+    for c in commits:
+        m = ISSUE_KEY.search(((c.get("commit") or {}).get("message") or "").split("\n", 1)[0])
+        if m:
+            cnt[m.group(1)] += 1
+    if not cnt:
+        return None
+    key, n = cnt.most_common(1)[0]
+    return key if n >= max(5, JIRA_DETECT_RATIO * len(commits)) else None
+
+
+def _jira_cache_path(key):
+    return os.path.join(CACHE_DIR, "jira", key + ".json")
+
+
+def jira_issues(jira_url, keys):
+    """批次抓 JIRA 單子的 reporter、標題、描述長度，回傳 {key: 資料或 None（不存在）}。
+    結果永久快取：reporter 和描述在單子做完之後幾乎不會再動，不值得每次重抓。
+    匿名存取 ASF JIRA 即可，不需要 token。"""
+    out, todo = {}, []
+    for k in dict.fromkeys(keys):
+        p = _jira_cache_path(k)
+        if _cache_enabled and os.path.exists(p):
+            try:
+                c = json.load(open(p))
+                if c is None or "description" in c:
+                    out[k] = c; continue
+            except ValueError:
+                pass
+        todo.append(k)
+    headers = {"Accept": "application/json", "User-Agent": "gh-activity"}
+
+    def parse(it):
+        f = it.get("fields") or {}
+        rep = f.get("reporter") or {}
+        return {"key": it["key"], "reporter": rep.get("name") or rep.get("key") or "",
+                "reporter_name": rep.get("displayName") or "", "title": f.get("summary") or "",
+                "created": f.get("created"), "desc_len": len((f.get("description") or "").strip()),
+                "description": (f.get("description") or "").strip(),   # 給 --dump 用
+                "url": f"{jira_url}/browse/{it['key']}"}
+
+    def fetch(url):
+        while True:
+            status, h, body = _request(url, headers)
+            _count(requests=1)
+            if status == 200:
+                return json.loads(body.decode())
+            if status in (400, 404):
+                return None
+            w = _retry_wait(status, h, body, url)
+            if w is None:
+                raise RuntimeError(f"JIRA HTTP {status}: {url} {body[:200]!r}")
+            _wait(w)
+
+    for i in range(0, len(todo), 100):
+        batch = todo[i:i + 100]
+        params = urllib.parse.urlencode({"jql": f"key in ({','.join(batch)})", "validateQuery": "false",
+                                         "fields": "reporter,summary,created,description", "maxResults": len(batch)})
+        data = fetch(f"{jira_url}/rest/api/2/search?{params}")
+        got = {}
+        if data is not None:
+            got = {it["key"]: parse(it) for it in data.get("issues", [])}
+        else:
+            # 批次查詢被拒（通常是某個 key 不存在而且 validateQuery 沒生效），退回一個一個查
+            for k in batch:
+                d = fetch(f"{jira_url}/rest/api/2/issue/{k}?fields=reporter,summary,created,description")
+                if d:
+                    got[k] = parse(d)
+        for k in batch:
+            out[k] = got.get(k)   # 查不到的存 None，下次不再查
+            if _cache_enabled:
+                try:
+                    os.makedirs(os.path.dirname(_jira_cache_path(k)), exist_ok=True)
+                    json.dump(out[k], open(_jira_cache_path(k), "w"))
+                except OSError:
+                    pass
+    return out
+
+
+def issue_score(row):
+    W = ISSUE_WEIGHTS
+    if W["min_desc"] and row["desc_len"] < W["min_desc"]:
+        row["score"], row["counted"], row["score_reasons"] = 0.0, 0.0, [f"desc<{W['min_desc']}"]
+        return
+    s, reasons = W["handed_off"], ["handed_off"]
+    if row["pr_assoc"] in NON_COMMITTER:
+        s += W["noncommitter"]; reasons.append("noncommitter")
+    row["score"] = row["counted"] = round(s, 2)
+    row["score_reasons"] = reasons
+
+
+def collect_handed_off(repo, since, until, users, jira_names, jira_project, jira_url, closed_by_commit):
+    """找出區間內「本人開的題目被別人的 PR 關掉且 merge」。回傳 {user: [issue row]}。
+    對象是區間內所有 merged PR（不限受評者有沒有參與），加上關掉但有 commit 進 default branch 的 PR。
+    GitHub issue 走 PR 的 closingIssuesReferences；JIRA 走 PR 標題的 key 反查 reporter。
+    jira_names 是 {JIRA 帳號（小寫）: GitHub login}。"""
+    qs = [lambda s, u: f"is:pr repo:{repo} is:merged merged:{s}..{u}"]
+    if closed_by_commit:
+        qs.append(lambda s, u: f"is:pr repo:{repo} is:unmerged is:closed closed:{s}..{u}")
+    prs, n_queries = [], 0
+    commit_date = {n: ((c.get("commit") or {}).get("committer") or {}).get("date") for n, c in closed_by_commit.items()}
+    for mk in qs:
+        items, n = search_date_range(mk, since, until, SEARCH_FIELDS_MERGED)
+        n_queries += n
+        for i in items:
+            if i.get("mergedAt"):
+                i["_merged_at"] = i["mergedAt"]
+            elif i["number"] in commit_date:
+                i["_merged_at"] = commit_date[i["number"]]   # YuniKorn 式：commit 訊息 Closes #N 關掉的
+            else:
+                continue
+            prs.append(i)
+    prs = {p["number"]: p for p in prs}.values()
+
+    # 每個 PR 關掉的題目：[(issue id, 開題人 GitHub login 或 None, 原始開題帳號, 標題, 網址, 描述長度, 來源)]
+    jira_keys = []
+    if jira_project:
+        for p in prs:
+            jira_keys += [f"{m.group(1)}-{m.group(2)}" for m in ISSUE_KEY.finditer(p["title"]) if m.group(1) == jira_project]
+    jira = jira_issues(jira_url, jira_keys) if jira_keys else {}
+
+    by_user = {u: [] for u in users}
+    seen = {}                 # issue id → 第一個關掉它的 PR（同一個 issue 被多個 PR 關只算第一個）
+    unmatched = Counter()     # 對不上 GitHub login 的 JIRA reporter（有題目被別人接走的才列）
+    user_lower = {u.lower(): u for u in users}
+    for p in sorted(prs, key=lambda x: x["_merged_at"]):
+        author = (p.get("author") or {}).get("login")
+        if is_bot(author) or is_backport(p["title"]):
+            continue
+        linked = []
+        for iss in ((p.get("closingIssuesReferences") or {}).get("nodes") or []):
+            if not iss:
+                continue
+            opener = (iss.get("author") or {}).get("login")
+            linked.append((f"#{iss['number']}", user_lower.get((opener or "").lower()), opener, iss["title"],
+                           iss["url"], (iss.get("body") or "").strip(), "github"))
+        if jira_project:
+            for m in ISSUE_KEY.finditer(p["title"]):
+                j = jira.get(f"{m.group(1)}-{m.group(2)}") if m.group(1) == jira_project else None
+                if j:
+                    linked.append((j["key"], jira_names.get(j["reporter"].lower()), j["reporter"], j["title"],
+                                   j["url"], j["description"], "jira"))
+        for iid, opener, raw, title, url, body, source in linked:
+            if iid in seen:
+                continue
+            seen[iid] = p["number"]
+            if raw and raw.lower() == (author or "").lower():
+                continue   # 自己開單自己做，不算出題
+            if opener is None:
+                if source == "jira" and raw:
+                    unmatched[raw] += 1
+                continue
+            row = {"id": iid, "title": title, "url": url, "source": source, "desc_len": len(body), "body": body,
+                   "pr_number": p["number"], "pr_title": p["title"], "pr_url": p["url"],
+                   "pr_author": author, "pr_assoc": p.get("authorAssociation") or "NONE",
+                   "taker_member": (author or "").lower() in user_lower,   # 接走的人是不是受評者（社群成員）
+                   "merged_at": p["_merged_at"]}
+            issue_score(row)
+            by_user[opener].append(row)
+    print(f"  出題：{n_queries} 次搜尋，{len(prs)} 個 merged PR，"
+          f"{'JIRA ' + jira_project + '（' + str(len(set(jira_keys))) + ' 張單）' if jira_project else 'GitHub issues'}，"
+          f"被接走的題目 {sum(len(v) for v in by_user.values())} 個", file=sys.stderr)
+    if unmatched:
+        # displayName 不拿來自動配對（會誤判），但印出來方便人眼認出是誰
+        display = {j["reporter"]: j["reporter_name"] for j in jira.values() if j}
+        print("  以下 JIRA reporter 有題目被別人接走，但對不上任何受評者的 GitHub login（需要的話在 users 裡填 jira 欄位）：",
+              file=sys.stderr)
+        for name, n in unmatched.most_common():
+            shown = f"{name}（{display[name]}）" if display.get(name) and display[name] != name else name
+            print(f"    {shown}：{n} 個", file=sys.stderr)
+    return by_user
+
+
 class PRCache:
     """一個 PR 的原始 API 回應（留言、reviews、commits、detail、files）。
     以搜尋結果的 updated_at 當版本：GitHub 在有新留言、review、commit、merge、關閉時都會更新它，
@@ -731,10 +959,11 @@ class PRCache:
             pass
 
 
-def analyze_repo(repo, users, since, until, with_commits=True):
+def analyze_repo(repo, users, since, until, with_commits=True, jira_names=None, jira_project=None, jira_url=DEFAULT_JIRA_URL):
     """抓一群人在一個 repo 的活動，回傳 {user: 統計結果}。
     搜尋是分批合併查的，每個 PR 的留言只抓一次，再拆給有參與的人。
-    with_commits 目前保留參數但一律會抓 commits（判斷關掉但有進 default branch 的 PR 要用）。"""
+    with_commits 目前保留參數但一律會抓 commits（判斷關掉但有進 default branch 的 PR 要用）。
+    jira_project：這個 repo 的題目在 JIRA 時的 project key；None 表示從 commit 訊息自動判斷，"" 表示強制不用 JIRA。"""
     users = list(users)
     user_set = set(users)
     print(f"\n== {repo}（{len(users)} 人）==", file=sys.stderr)
@@ -747,7 +976,8 @@ def analyze_repo(repo, users, since, until, with_commits=True):
     closed_by_commit = {}   # PR 編號 → 提到它的 commit（區間內、default branch）
     print("下載 commits ...", file=sys.stderr)
     t0, s0 = time.time(), _snapshot()
-    for c in get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"}):
+    commits = get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"})
+    for c in commits:
         login = (c.get("author") or {}).get("login")
         if login in user_set:
             commits_by_user[login] += 1
@@ -761,6 +991,15 @@ def analyze_repo(repo, users, since, until, with_commits=True):
     t0, s0 = time.time(), _snapshot()
     prs, n_queries = search_prs(repo, since, users)
     print(f"  {n_queries} 次搜尋，{len(prs)} 個 PR，{_elapsed(t0, s0)}", file=sys.stderr)
+
+    # 2b. 出題：區間內所有 merged PR 關掉了誰開的題目。JIRA 專案從 commit 訊息自動判斷，設定檔可覆蓋
+    if jira_project is None:
+        jira_project = detect_jira_project(commits)
+    print("搜尋出題被接走的 issue" + (f"（JIRA {jira_project}）" if jira_project else "") + " ...", file=sys.stderr)
+    t0, s0 = time.time(), _snapshot()
+    issues_by_user = collect_handed_off(repo, since, until, users, jira_names or {u.lower(): u for u in users},
+                                        jira_project or None, jira_url, closed_by_commit)
+    print(f"  {_elapsed(t0, s0)}", file=sys.stderr)
 
     login = lambda r: (r.get("user") or {}).get("login")
 
@@ -921,10 +1160,19 @@ def analyze_repo(repo, users, since, until, with_commits=True):
         for o in d["own_prs"]: o["repo"] = repo
         scored.sort(key=lambda x: -x["score"])
         reviewed.sort(key=lambda x: -x["score"])
+        # 出題：同一個 PR 本人已拿到 mentored（出題又帶人到 merge）就不重複給，否則一個 PR 會變 10 分以上
+        issues = issues_by_user.get(u, [])
+        mentored_prs = {r["number"] for r in reviewed if r["mentored"]}
+        for r in issues:
+            r["repo"] = repo
+            if r["pr_number"] in mentored_prs and r["counted"]:
+                r["counted"] = 0.0; r["score_reasons"].append("mentored_same_pr")
+        issues.sort(key=lambda x: (-x["counted"], -x["score"]))
         by_type = Counter(c["type"] for c in comments)
         results[u] = {
             "user": u, "repo": repo, "since": since, "until": until,
             "commits": commits_by_user[u], "scored": scored, "reviewed": reviewed, "comments": comments,
+            "issues": issues,
             "comment_prs": len({c["pr"] for c in comments}),
             "issue_comments": by_type["issue_comment"], "review_comments": by_type["review_comment"],
             "reviews": by_type["review"], "comments_total": len(comments),
@@ -960,8 +1208,9 @@ def median(xs, default):
     return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
 
 
-def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_REVIEW_DEFAULT)):
+def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_REVIEW_DEFAULT), issues=None):
     """從 PR 清單和統計數字算出各分數，單 repo 和跨 repo 合併都用這個。"""
+    issues = issues if issues is not None else stats.get("issues", [])
     pr_q, pr_q_text = quality(scored, "PR ", QUALITY_TOP_N_PR, baselines[0])
     rv_depth, rv_depth_text = quality(reviewed, "review ", QUALITY_TOP_N_REVIEW, baselines[1])
     n_sub = sum(1 for r in reviewed if r["substantive"])
@@ -976,11 +1225,16 @@ def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_RE
     gen_total = round(sum(r["counted"] for r in scored if not r["important"]), 2)
     pr_total = round(imp_total + gen_total, 2)
     rv_total = round(sum(r["score"] for r in reviewed), 2)
+    iss_total = round(sum(r["counted"] for r in issues), 2)
     merged = sum(1 for r in scored if r["merged_at"])
     return {
         "pr_total": pr_total, "imp_total": imp_total, "gen_total": gen_total,
-        "rv_total": rv_total,
-        "total": round(rv_total + imp_total + gen_total, 2),
+        "rv_total": rv_total, "iss_total": iss_total,
+        "n_issues": sum(1 for r in issues if r["counted"]),
+        "n_issues_all": len(issues),
+        "n_issues_nc": sum(1 for r in issues if r["counted"] and r["pr_assoc"] in NON_COMMITTER),
+        "n_issues_member": sum(1 for r in issues if r["counted"] and r.get("taker_member")),
+        "total": round(rv_total + iss_total + imp_total + gen_total, 2),
         "pr_q": pr_q, "pr_q_text": pr_q_text, "rv_q": rv_q, "rv_q_text": rv_q_text,
         "rv_depth": rv_depth, "rv_breadth": breadth,
         "q_total": q_total, "q_text": q_text,
@@ -994,11 +1248,15 @@ def metrics(scored, reviewed, stats, baselines=(BASELINE_PR_DEFAULT, BASELINE_RE
     }
 
 
-def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
+def summary_lines(scored, reviewed, stats, m, title, show_repo=False, issues=None):
+    issues = issues if issues is not None else stats.get("issues", [])
     lines = [
         f"{title}", "",
         f"總分：{m['total']:+.2f}",
         f"- Review 別人的 PR：{m['rv_total']:+.2f}（{m['n_reviewed']} 個加總）",
+        f"- 出題被接走：{m['iss_total']:+.2f}（本人開的 issue 被別人的 PR 關掉且 merge，計分 {m['n_issues']} 個，"
+        f"其中非 committer 接走 {m['n_issues_nc']} 個、受評者（社群成員）接走 {m['n_issues_member']} 個；"
+        f"每個 +{ISSUE_WEIGHTS['handed_off']:g}，非 committer 再 +{ISSUE_WEIGHTS['noncommitter']:g}）",
         f"- 重要 PR：{m['imp_total']:+.2f}（重要性 ≥ {IMPORTANT_PR_MIN:g} 的 PR，已 merge {m['n_important']} 個）",
         f"- 一般 PR：{m['gen_total']:+.2f}（乘 {PR_BUCKET_FACTOR['general']:g}；未 merge 再乘 {PR_STATE_FACTOR['open']:g}，關掉不計）", "",
         f"品質分：{m['q_text']}",
@@ -1035,6 +1293,12 @@ def summary_lines(scored, reviewed, stats, m, title, show_repo=False):
             detail = (f"行內 {r['review_comments']}（實質 {r.get('inline_substantive', 0)}）、一般 {r['issue_comments']}、結論 {r['reviews']}"
                       + (f"、{', '.join(r['score_reasons'])}" if r["score_reasons"] else ""))
             lines.append(f"- [{r['score']:+.2f}] {tag(r)}#{r['number']} {r['title']}　（{detail}）")
+    if issues:
+        lines += ["", "出題被接走的 issue（由高到低；[分數 → 計入總分]）", ""]
+        for r in issues:
+            who = f"{r['pr_author']}（{r['pr_assoc']}{'、社群成員' if r.get('taker_member') else ''}）"
+            lines.append(f"- [{r['score']:+g} → {r['counted']:+g}] {tag(r)}{r['id']} {r['title']}　"
+                         f"（{who}的 #{r['pr_number']} 接走；{', '.join(r['score_reasons'])}）")
     return lines
 
 
@@ -1048,6 +1312,8 @@ def combine(results):
     scored = sorted((r for res in results for r in res["scored"]), key=lambda x: -x["score"])
     reviewed = sorted((r for res in results for r in res["reviewed"]), key=lambda x: -x["score"])
     stats = {k: sum(res[k] for res in results) for k in STAT_KEYS}
+    stats["issues"] = sorted((r for res in results for r in res.get("issues", [])),
+                             key=lambda x: (-x["counted"], -x["score"]))
     return scored, reviewed, stats
 
 
@@ -1130,6 +1396,22 @@ def dump_user(path, user, repos, results, scored, reviewed, stats, m, since, unt
             lines += ["  " + l for l in body.splitlines()]
             lines.append("")
         lines.append("")
+    issues = stats.get("issues", [])
+    if issues:
+        lines += ["", "## 出題被接走的 issue 全文", "",
+                  f"{len(issues)} 個本人開的 issue / JIRA，區間內被別人的 PR 關掉且 merge。附上題目描述全文，可以看出題的難度和寫得多清楚。", ""]
+        for r in issues:
+            who = f"{r['pr_author']}（{r['pr_assoc']}{'、社群成員' if r.get('taker_member') else ''}）"
+            lines += [f"### {r['repo']} {r['id']} {r['title']}", r["url"],
+                      f"{who}的 {r['pr_url']} 接走，{(r['merged_at'] or '')[:10]} merge；"
+                      f"分數 {r['score']:+g} → 計入 {r['counted']:+g}（{', '.join(r['score_reasons'])}）", ""]
+            body = (r.get("body") or "").replace("\r\n", "\n").strip()
+            if body:
+                lines.append(f"- [題目描述]（{len(body)} 字）")
+                lines += ["  " + l for l in body.splitlines()]
+            else:
+                lines.append("- [題目描述]（無文字）")
+            lines += ["", ""]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -1179,21 +1461,33 @@ def main():
     if not TOKEN:
         sys.exit("未設定 GITHUB_TOKEN，每小時只有 60 次額度，跑不完。請 export GITHUB_TOKEN=... 後再執行。")
 
+    jira_cfg, jira_url = {}, DEFAULT_JIRA_URL
     if a.config:
         cfg = load_config(a.config)
         since, until = cfg.get("since") or a.since, cfg.get("until") or a.until
+        # 每個人可以是 "login" 或 {"user": "login", "jira": "JIRA 帳號"}（JIRA 帳號和 GitHub 不同時才要填）
+        person = lambda u: {"user": u, "jira": None} if isinstance(u, str) else {"user": u["user"], "jira": u.get("jira")}
         if "users" in cfg:
             # 新格式：每個人都查全部 repo
             repos = [normalize_repo(r) for r in cfg["repos"]]
-            people = [{"user": u, "repos": repos} for u in cfg["users"]]
+            people = [dict(person(u), repos=repos) for u in cfg["users"]]
         else:
             # 舊格式：每個人各自列 repo
-            people = [{"user": p["user"], "repos": [normalize_repo(r) for r in p["repos"]]} for p in cfg["people"]]
+            people = [dict(person(p), repos=[normalize_repo(r) for r in p["repos"]]) for p in cfg["people"]]
+        # 哪些 repo 的題目在 JIRA：{"apache/kafka": "KAFKA"}；值給 null 或 "" 表示強制不用 JIRA。沒列的自動判斷
+        jira_cfg = {normalize_repo(r): (k or "") for r, k in (cfg.get("jira") or {}).items()}
+        jira_url = (cfg.get("jira_url") or DEFAULT_JIRA_URL).rstrip("/")
     elif a.repo and a.user:
-        people = [{"user": a.user, "repos": [normalize_repo(a.repo)]}]
+        people = [{"user": a.user, "jira": None, "repos": [normalize_repo(a.repo)]}]
         since, until = a.since, a.until
     else:
         ap.error("請給 --config，或同時給 --repo 與 --user")
+    # JIRA 帳號 → GitHub login：預設兩者相同（不分大小寫），設定檔有填 jira 的用填的
+    jira_names = {}
+    for p in people:
+        jira_names[p["user"].lower()] = p["user"]
+        if p["jira"]:
+            jira_names[p["jira"].lower()] = p["user"]
     today = datetime.now(timezone.utc).date()
     until = until or today.isoformat()
     since = since or (today - timedelta(days=DEFAULT_DAYS)).isoformat()
@@ -1215,7 +1509,8 @@ def main():
     skipped = {}
     for repo, users in repo_users.items():
         try:
-            for u, res in analyze_repo(repo, users, since, until, with_commits).items():
+            for u, res in analyze_repo(repo, users, since, until, with_commits,
+                                       jira_names=jira_names, jira_project=jira_cfg.get(repo), jira_url=jira_url).items():
                 results_by_user[u].append(res)
         except RepoInaccessible as e:
             print(f"  跳過：{e}", file=sys.stderr)
@@ -1270,34 +1565,39 @@ def main():
     # 多人：總表 + 每人明細
     rows.sort(key=lambda x: -x[1]["total"])
     out = [f"# 評比結果", f"區間：{since} ~ {until}",
-           f"總分 = review + 重要 PR + 一般 PR。重要 PR：重要性 ≥ {IMPORTANT_PR_MIN:g}；"
+           f"總分 = review + 出題 + 重要 PR + 一般 PR。重要 PR：重要性 ≥ {IMPORTANT_PR_MIN:g}；"
            f"一般 PR 乘 {PR_BUCKET_FACTOR['general']:g}；未 merge 的 PR 乘 {PR_STATE_FACTOR['open']:g}，關掉不計"
-           f"（關掉但有 commit 進 default branch 的，例如 YuniKorn 的合併方式，視同 merge）",
+           f"（關掉但有 commit 進 default branch 的，例如 YuniKorn 的合併方式，視同 merge）。"
+           f"出題：本人開的 issue / JIRA 被別人的 PR 關掉且 merge，每個 +{ISSUE_WEIGHTS['handed_off']:g}，"
+           f"非 committer 接走再 +{ISSUE_WEIGHTS['noncommitter']:g}"
+           + (f"，描述少於 {ISSUE_WEIGHTS['min_desc']} 字不算" if ISSUE_WEIGHTS['min_desc'] else ""),
            f"品質分基準值（樣本不足時補入）：PR {baselines[0]:.2f}、review {baselines[1]:.2f}（全體中位數）；沒有活動就是 0", "",
            "## 總表（依總分排序）", "",
-           "| 人 | 總分 | review | 重要 PR | 一般 PR | 品質分 | PR merge/開 | 重要 | Review PR | 深度 | 帶非 committer | 主要 repo |",
-           "|---|---|---|---|---|---|---|---|---|---|---|---|"]
+           "| 人 | 總分 | review | 出題 | 重要 PR | 一般 PR | 品質分 | PR merge/開 | 重要 | Review PR | 深度 | 帶非 committer | 出題被接走（接走的人） | 主要 repo |",
+           "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|"]
     if skipped:
         out.insert(3, "無法存取而跳過的 repo：" + "、".join(skipped))
     for p, m, results, scored, reviewed, stats in rows:
         main = f"{m['main_repo']}（{m['main_repo_total']:+.1f}）" if m["main_repo"] else "無"
-        out.append(f"| {p['user']} | {m['total']:+.1f} | {m['rv_total']:+.1f} | {m['imp_total']:+.1f} "
+        out.append(f"| {p['user']} | {m['total']:+.1f} | {m['rv_total']:+.1f} | {m['iss_total']:+.1f} | {m['imp_total']:+.1f} "
                    f"| {m['gen_total']:+.1f} | {fmt(m['q_total'])} "
                    f"| {m['n_merged']}/{m['n_pr']} | {m['n_important']} "
                    f"| {m['n_reviewed']} | {m['deep_reviews']} | {stats['mentored']} "
+                   f"| {m['n_issues']}（非 committer {m['n_issues_nc']}、社群 {m['n_issues_member']}） "
                    f"| {main} |")
     out += ["", f"## 全體活動量（{len(rows)} 人加總，原始數字不計分）", "",
-            "| repo | 開的 PR | 已 merge | 還開著 | Review 過的 PR | 留言總數 | Review 非 committer（新人） | 帶非 committer |",
-            "|---|---|---|---|---|---|---|---|"]
+            "| repo | 開的 PR | 已 merge | 還開著 | Review 過的 PR | 留言總數 | Review 非 committer（新人） | 帶非 committer | 出題被接走 |",
+            "|---|---|---|---|---|---|---|---|---|"]
     by_repo = {}
     for p, m, results, scored, reviewed, stats in rows:
         for res in results:
-            g = by_repo.setdefault(res["repo"], {"n_pr": 0, "n_merged": 0, "n_open": 0, "n_reviewed": 0,
+            g = by_repo.setdefault(res["repo"], {"n_pr": 0, "n_merged": 0, "n_open": 0, "n_reviewed": 0, "n_issues": 0,
                                                  **{k: 0 for k in STAT_KEYS}})
             g["n_pr"] += len(res["scored"])
             g["n_merged"] += sum(1 for r in res["scored"] if r["merged_at"])
             g["n_open"] += sum(1 for r in res["scored"] if r["pr_state"] == "open")
             g["n_reviewed"] += len(res["reviewed"])
+            g["n_issues"] += sum(1 for r in res.get("issues", []) if r["counted"])
             for k in STAT_KEYS:
                 g[k] += res[k]
     groups = list(by_repo.items())
@@ -1306,7 +1606,7 @@ def main():
         groups.append(("合計", total))
     for name, g in groups:
         out.append(f"| {name} | {g['n_pr']} | {g['n_merged']} | {g['n_open']} | {g['n_reviewed']} | {g['comments_total']} "
-                   f"| {g['reviewed_noncommitter']}（{g['reviewed_newcomer']}） | {g['mentored']} |")
+                   f"| {g['reviewed_noncommitter']}（{g['reviewed_newcomer']}） | {g['mentored']} | {g['n_issues']} |")
     if a.detail:
         for p, m, results, scored, reviewed, stats in rows:
             out += ["", "---", "", f"## {p['user']}", ""]
