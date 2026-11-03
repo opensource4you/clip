@@ -34,7 +34,7 @@ CACHE_DIR = os.environ.get("COMMUNITY_PRS_CACHE") or os.path.join(os.path.expand
 
 BATCH = 5           # authors per GraphQL request (bigger batches hit GitHub's 502 timeout)
 PER_AUTHOR = 50     # PRs per page per author; more pages are fetched when needed
-WORKERS = 4         # concurrent requests
+WORKERS = 8         # concurrent requests
 RETRIES = 4
 
 
