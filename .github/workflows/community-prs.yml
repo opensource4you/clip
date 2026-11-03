@@ -40,9 +40,10 @@ jobs:
       - name: Build pages
         run: |
           mkdir -p site
-          python3 community_prs.py --people-file people_all.json --no-cache \
+          NAV=(--nav "open=index.html" --nav "merged 30d=merged.html")
+          python3 community_prs.py --people-file people_all.json --no-cache "${NAV[@]}" \
             --out site/index.html
-          python3 community_prs.py --people-file people_all.json --no-cache \
+          python3 community_prs.py --people-file people_all.json --no-cache "${NAV[@]}" \
             --state merged --since "$(date -u -d '30 days ago' +%F)" \
             --out site/merged.html
 

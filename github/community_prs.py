@@ -108,8 +108,9 @@ def build_query(authors, state, since, scope="", cursors=None):
     issueCount
     pageInfo {{ hasNextPage endCursor }}
     nodes {{ ... on PullRequest {{
-      number title url isDraft createdAt updatedAt mergedAt state reviewDecision
+      number title url isDraft createdAt updatedAt mergedAt state reviewDecision mergeable
       author {{ login }}
+      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
       repository {{ nameWithOwner }}
       labels(first: 6) {{ nodes {{ name }} }}
       comments {{ totalCount }}
@@ -188,8 +189,18 @@ def review_label(pr):
     if d == "CHANGES_REQUESTED":
         return "changes requested", "warn"
     if pr["reviews"]["totalCount"] == 0:
-        return "no review yet", "bad"
+        return "no review", "bad"
     return "in review", "info"
+
+
+def ci_state(pr):
+    """SUCCESS / FAILURE / PENDING / None (no checks or unknown)."""
+    try:
+        st = pr["commits"]["nodes"][0]["commit"]["statusCheckRollup"]["state"]
+    except (KeyError, IndexError, TypeError):
+        return None
+    return {"SUCCESS": "SUCCESS", "FAILURE": "FAILURE", "ERROR": "FAILURE",
+            "PENDING": "PENDING", "EXPECTED": "PENDING"}.get(st)
 
 
 def dispatch_target(cli):
@@ -205,8 +216,15 @@ def dispatch_target(cli):
     return None
 
 
-def render(result, repos, state, since, dispatch=None):
+def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
     e = html.escape
+    navhtml = ""
+    if nav:
+        items = []
+        for label, href in nav:
+            cur = os.path.basename(href) == os.path.basename(out_name)
+            items.append(f'<b>{e(label)}</b>' if cur else f'<a href="{e(href)}">{e(label)}</a>')
+        navhtml = '<nav class="pages">' + " · ".join(items) + '</nav>'
     try:
         from zoneinfo import ZoneInfo
         now = dt.datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M (Taipei)")
@@ -237,13 +255,25 @@ def render(result, repos, state, since, dispatch=None):
             repo = p["repository"]["nameWithOwner"]
             stale = p["state"] == "OPEN" and days_ago(p[stale_key]) >= 14
             labels = " ".join(f'<span class="lbl">{e(l["name"])}</span>' for l in p["labels"]["nodes"])
+            flags, ftext = [], []
+            if p["state"] == "OPEN":
+                ci = ci_state(p)
+                if ci == "FAILURE":
+                    flags.append('<span class="fl ci-bad" title="latest commit: checks failed">✗ CI</span>'); ftext.append("ci failed")
+                elif ci == "PENDING":
+                    flags.append('<span class="fl ci-wait" title="latest commit: checks running">… CI</span>'); ftext.append("ci pending")
+                elif ci == "SUCCESS":
+                    flags.append('<span class="fl ci-ok" title="latest commit: checks passed">✓ CI</span>'); ftext.append("ci passed")
+                if p.get("mergeable") == "CONFLICTING":
+                    flags.append('<span class="fl conflict" title="has merge conflicts, needs rebase">⚠ conflict</span>'); ftext.append("conflict")
+            conflict = int(p.get("mergeable") == "CONFLICTING" and p["state"] == "OPEN")
             body.append(
-                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" '
-                f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)}">'
+                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" '
+                f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {" ".join(ftext)}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
                 f'<td class="title"><span class="mrepo">{e(repo.split("/")[-1])}</span>{e(p["title"])}<div>{labels}</div></td>'
-                f'<td><span class="st {cls}">{e(lab)}</span></td>'
+                f'<td><span class="st {cls}">{e(lab)}</span>{"".join(flags)}</td>'
                 f'<td class="n">{p["comments"]["totalCount"]}</td>'
                 f'<td class="n">{days_ago(p["createdAt"])}d</td>'
                 f'<td class="n{" stale" if stale else ""}">{days_ago(p["updatedAt"])}d</td>'
@@ -274,6 +304,9 @@ tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-we
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:#e6e6e6}} .summary th.on::after{{content:" ↓";color:#666}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:#666}}
 .mrepo{{display:none}}
+.fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:#b00;font-weight:600}} .ci-wait{{color:#7a5200}} .ci-ok{{color:#166016}}
+.gstat .cf{{color:#b00}}
+nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:#e6e6e6;border-radius:4px}} nav.pages a{{padding:2px 8px}}
 @media (max-width:700px){{
   body{{margin:12px auto;padding:0 10px;font-size:13px}}
   h1{{font-size:17px}} .meta{{font-size:12px}}
@@ -284,13 +317,14 @@ tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-we
   td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6){{padding:0;font-size:0;overflow:hidden}}
   .c-num{{width:56px}} .c-st{{width:88px}} .c-n:nth-child(7){{width:64px}} .prs th{{font-size:12px}}
   .st{{white-space:normal;font-size:11px}}
-  .mrepo{{display:inline-block;color:#888;font-size:11px;margin-right:6px}}
-  .lbl{{font-size:10px}}
+  .mrepo{{color:#888;font-size:11px}}
+  .lbl{{font-size:10px;margin-top:1px}} .prs td.title div{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+  .mrepo{{display:block;margin:0}}
   tr.grp td{{font-size:14px}}
 }}
 </style></head><body>
 <h1>{e(title)}</h1>
-<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
+{navhtml}<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
@@ -312,14 +346,14 @@ tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-we
       r.style.display=ok?'':'none';
       if(!ok) return;
       shown++;
-      var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0}});
-      p.n++; if(r.dataset.status==='no review yet') p.nr++; if(r.dataset.stale==='1') p.st++;
+      var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0,cf:0}});
+      p.n++; if(r.dataset.status==='no review') p.nr++; if(r.dataset.stale==='1') p.st++; if(r.dataset.conflict==='1') p.cf++;
     }});
     document.body.classList.toggle('onerepo',!!repo);
     document.querySelectorAll('tr.grp').forEach(function(g){{
-      var p=per[g.dataset.login]||{{n:0,nr:0,st:0}};
+      var p=per[g.dataset.login]||{{n:0,nr:0,st:0,cf:0}};
       g.style.display=p.n?'':'none'; g.querySelector('small').textContent=p.n;
-      g.querySelector('.gstat').innerHTML=(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' stale</b>':'');
+      g.querySelector('.gstat').innerHTML=(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' stale</b>':'')+(p.cf?'<b class="cf">'+p.cf+' conflict</b>':'');
     }});
     var logins=Object.keys(per).sort(function(a,b){{
       var d=sortKey==='login'?a.toLowerCase().localeCompare(b.toLowerCase()):per[a][sortKey]-per[b][sortKey];
@@ -352,6 +386,8 @@ def main():
     ap.add_argument("--no-cache", action="store_true", help="neither read nor write the cache")
     ap.add_argument("--dispatch", metavar="OWNER/REPO:FILE.yml",
                     help="add a link to this workflow's Actions page for manual refresh; auto-detected inside GitHub Actions")
+    ap.add_argument("--nav", action="append", metavar="LABEL=FILE",
+                    help="repeatable; links between generated pages, e.g. --nav open=index.html --nav 'merged 30d=merged.html'")
     ap.add_argument("--max-age", type=int, default=0, metavar="MIN",
                     help="reuse cached results younger than MIN minutes (0 = always fetch)")
     args = ap.parse_args()
@@ -385,7 +421,8 @@ def main():
             os.replace(tmp, cache_path)
 
     with open(args.out, "w") as f:
-        f.write(render(result, repos, args.state, args.since, dispatch_target(args.dispatch)))
+        nav = [tuple(n.split("=", 1)) for n in (args.nav or []) if "=" in n]
+        f.write(render(result, repos, args.state, args.since, dispatch_target(args.dispatch), nav, args.out))
     total = sum(len(v) for v in result.values())
     print(f"{total} PRs from {len(people)} people -> {args.out}")
 
