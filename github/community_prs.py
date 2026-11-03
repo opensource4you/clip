@@ -238,7 +238,17 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
     title = f"Community PRs ({state}{', since ' + since if since else ''})"
     total = sum(len(v) for v in result.values())
     stale_key = "updatedAt"
+    openmode = state == "open"
 
+    def took(p):
+        """days from opening to merge (or to last update for closed-unmerged)."""
+        end = p.get("mergedAt") or p["updatedAt"]
+        a = dt.datetime.fromisoformat(p["createdAt"].replace("Z", "+00:00"))
+        b = dt.datetime.fromisoformat(end.replace("Z", "+00:00"))
+        return max(0, (b - a).days)
+
+    sumcols = ('<th data-k="nr">no review</th><th data-k="st">stale ≥14d</th>' if openmode else
+               '<th data-k="rp" title="distinct repos">repos</th><th data-k="ad" title="average days from open to merge">avg days</th>')
     seen_repos = sorted({p["repository"]["nameWithOwner"] for prs in result.values() for p in prs}, key=str.lower)
     options = "".join(f'<option value="{e(r)}">{e(r)}</option>' for r in seen_repos)
 
@@ -267,21 +277,28 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                 if p.get("mergeable") == "CONFLICTING":
                     flags.append('<span class="fl conflict" title="has merge conflicts, needs rebase">⚠ conflict</span>'); ftext.append("conflict")
             conflict = int(p.get("mergeable") == "CONFLICTING" and p["state"] == "OPEN")
+            days = took(p)
+            if openmode:
+                tail = (f'<td class="n">{days_ago(p["createdAt"])}d</td>'
+                        f'<td class="n{" stale" if stale else ""}">{days_ago(p["updatedAt"])}d</td>')
+            else:
+                end = p.get("mergedAt") or p["updatedAt"]
+                tail = f'<td class="n">{days}d</td><td class="n">{days_ago(end)}d</td>'
             body.append(
-                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" '
+                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" '
                 f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {" ".join(ftext)}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
                 f'<td class="title"><span class="mrepo">{e(repo.split("/")[-1])}</span>{e(p["title"])}<div>{labels}</div></td>'
                 f'<td><span class="st {cls}">{e(lab)}</span>{"".join(flags)}</td>'
                 f'<td class="n">{p["comments"]["totalCount"]}</td>'
-                f'<td class="n">{days_ago(p["createdAt"])}d</td>'
-                f'<td class="n{" stale" if stale else ""}">{days_ago(p["updatedAt"])}d</td>'
-                f'</tr>')
+                + tail + '</tr>')
     main_table = ('<table class="prs"><colgroup><col class="c-repo"><col class="c-num"><col class="c-title">'
                   '<col class="c-st"><col class="c-n"><col class="c-n"><col class="c-n"></colgroup>'
                   '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
-                  '<th class="n">opened</th><th class="n">updated</th></tr></thead><tbody>'
+                  + ('<th class="n">opened</th><th class="n">updated</th>' if openmode else
+                     '<th class="n" title="days from open to merge">took</th><th class="n" title="merged how long ago">merged</th>')
+                  + '</tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
 
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{e(title)}</title>
@@ -328,10 +345,11 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
-<table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th><th data-k="nr">no review</th><th data-k="st">stale ≥14d</th></tr></thead><tbody id="sum"></tbody></table>
+<table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table>
 {main_table}
 <script>
 (function(){{
+  var OPEN={"true" if openmode else "false"};
   var q=document.getElementById('q'), sel=document.getElementById('repo'), sum=document.getElementById('sum'), cnt=document.getElementById('count');
   var rows=Array.prototype.slice.call(document.querySelectorAll('tr.pr'));
   var ths=Array.prototype.slice.call(document.querySelectorAll('.summary th')), sortKey='n', sortAsc=false;
@@ -346,22 +364,28 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
       r.style.display=ok?'':'none';
       if(!ok) return;
       shown++;
-      var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0,cf:0}});
+      var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0,cf:0,days:0,repos:{{}}}});
       p.n++; if(r.dataset.status==='no review') p.nr++; if(r.dataset.stale==='1') p.st++; if(r.dataset.conflict==='1') p.cf++;
+      p.days+=(+r.dataset.days||0); p.repos[r.dataset.repo]=1;
     }});
     document.body.classList.toggle('onerepo',!!repo);
     document.querySelectorAll('tr.grp').forEach(function(g){{
-      var p=per[g.dataset.login]||{{n:0,nr:0,st:0,cf:0}};
+      var p=per[g.dataset.login]||{{n:0,nr:0,st:0,cf:0,days:0}};
       g.style.display=p.n?'':'none'; g.querySelector('small').textContent=p.n;
-      g.querySelector('.gstat').innerHTML=(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' stale</b>':'')+(p.cf?'<b class="cf">'+p.cf+' conflict</b>':'');
+      g.querySelector('.gstat').innerHTML=OPEN
+        ?(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' stale</b>':'')+(p.cf?'<b class="cf">'+p.cf+' conflict</b>':'')
+        :(p.n?'<b>avg '+Math.round(p.days/p.n)+'d to merge</b>':'');
     }});
+    Object.keys(per).forEach(function(l){{var p=per[l]; p.rp=Object.keys(p.repos).length; p.ad=p.n?Math.round(p.days/p.n):0;}});
     var logins=Object.keys(per).sort(function(a,b){{
       var d=sortKey==='login'?a.toLowerCase().localeCompare(b.toLowerCase()):per[a][sortKey]-per[b][sortKey];
       if(!sortAsc)d=-d;
       return d||a.toLowerCase().localeCompare(b.toLowerCase());
     }});
     ths.forEach(function(t){{t.classList.toggle('on',t.dataset.k===sortKey);t.classList.toggle('asc',sortAsc);}});
-    sum.innerHTML=logins.map(function(l){{var p=per[l];return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td><td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td></tr>';}}).join('');
+    sum.innerHTML=logins.map(function(l){{var p=per[l];
+      var c=OPEN?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td>'+p.rp+'</td><td>'+p.ad+'d</td>';
+      return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td>'+c+'</tr>';}}).join('');
     cnt.textContent=shown+' PRs · '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
   }}
