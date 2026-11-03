@@ -302,28 +302,42 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                   + "".join(body) + '</tbody></table>')
 
     return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{e(title)}</title>
+<script>try{{var t=localStorage.getItem('cprs.theme');if(t)document.documentElement.setAttribute('data-theme',t);}}catch(e){{}}</script>
 <style>
-body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;padding:0 24px;max-width:1500px;color:#222;background:#fafafa}}
+:root{{--bg:#fafafa;--fg:#222;--muted:#666;--faint:#888;--panel:#fff;--head:#f0f0f0;--head-hover:#e6e6e6;--grp:#f7f7f7;--line:#e5e5e5;--line2:#ddd;
+  --link:#0645ad;--lbl-bg:#eef;--lbl-fg:#336;--ok-bg:#dcf5dc;--ok-fg:#166016;--warn-bg:#fff0cc;--warn-fg:#7a5200;--bad-bg:#fde0e0;--bad-fg:#8a1c1c;
+  --info-bg:#e0ecfd;--info-fg:#1c4a8a;--muted-bg:#eee;--red:#b00;--input-bg:#fff;--input-bd:#ccc}}
+:root:not([data-theme="light"]){{color-scheme:light}}
+@media (prefers-color-scheme:dark){{:root:not([data-theme="light"]){{--bg:#111418;--fg:#e4e6ea;--muted:#9aa0a8;--faint:#7c838c;--panel:#1a1e24;--head:#232931;--head-hover:#2c333d;--grp:#20252c;--line:#2a3039;--line2:#3a414b;
+  --link:#7ab3ff;--lbl-bg:#263048;--lbl-fg:#b7c6ef;--ok-bg:#1b3a22;--ok-fg:#8fdc9a;--warn-bg:#3d3112;--warn-fg:#f0c86a;--bad-bg:#45201f;--bad-fg:#ff9b94;
+  --info-bg:#1d3150;--info-fg:#9cc3ff;--muted-bg:#2b3037;--red:#ff7b72;--input-bg:#1a1e24;--input-bd:#3a414b;color-scheme:dark}}}}
+:root[data-theme="dark"]{{--bg:#111418;--fg:#e4e6ea;--muted:#9aa0a8;--faint:#7c838c;--panel:#1a1e24;--head:#232931;--head-hover:#2c333d;--grp:#20252c;--line:#2a3039;--line2:#3a414b;
+  --link:#7ab3ff;--lbl-bg:#263048;--lbl-fg:#b7c6ef;--ok-bg:#1b3a22;--ok-fg:#8fdc9a;--warn-bg:#3d3112;--warn-fg:#f0c86a;--bad-bg:#45201f;--bad-fg:#ff9b94;
+  --info-bg:#1d3150;--info-fg:#9cc3ff;--muted-bg:#2b3037;--red:#ff7b72;--input-bg:#1a1e24;--input-bd:#3a414b;color-scheme:dark}}
+body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;padding:0 24px;max-width:1500px;color:var(--fg);background:var(--bg)}}
+a{{color:var(--link)}}
 body.onerepo .c-repo{{width:0}} body.onerepo td.repo,body.onerepo th.repo{{padding:0;font-size:0;overflow:hidden}}
-h1{{font-size:20px;margin:0 0 4px}} .meta{{color:#666;margin-bottom:16px}}
-table{{border-collapse:collapse;width:100%;background:#fff}} th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #e5e5e5;vertical-align:top}}
-th{{background:#f0f0f0;font-weight:600}} th.n,td.n{{text-align:right;white-space:nowrap}} td.repo{{color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+body.onerepo .summary th[data-k="rp"],body.onerepo .summary td.rp{{display:none}}
+h1{{font-size:20px;margin:0 0 4px}} .meta{{color:var(--muted);margin-bottom:16px}}
+table{{border-collapse:collapse;width:100%;background:var(--panel)}} th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}}
+th{{background:var(--head);font-weight:600}} th.n,td.n{{text-align:right;white-space:nowrap}} td.repo{{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .prs{{table-layout:fixed;margin-top:20px}} .prs thead th{{position:sticky;top:0;z-index:1}}
 .c-repo{{width:150px}} .c-num{{width:70px}} .c-st{{width:150px}} .c-n{{width:70px}}
 .prs td.title{{overflow-wrap:anywhere}}
-tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:#888;font-weight:normal}} .gstat{{font-weight:normal;font-size:12px;margin-left:10px}} .gstat b{{font-weight:600;margin-right:10px}} .gstat .nr{{color:#8a1c1c}} .gstat .sl{{color:#b00}}
-.lbl{{display:inline-block;font-size:11px;background:#eef;color:#336;border-radius:10px;padding:0 7px;margin:2px 4px 0 0}}
+tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:var(--faint);font-weight:normal}} .gstat{{font-weight:normal;font-size:12px;margin-left:10px}} .gstat b{{font-weight:600;margin-right:10px}} .gstat .nr{{color:var(--bad-fg)}} .gstat .sl{{color:var(--red)}}
+.lbl{{display:inline-block;font-size:11px;background:var(--lbl-bg);color:var(--lbl-fg);border-radius:10px;padding:0 7px;margin:2px 4px 0 0}}
 .st{{white-space:nowrap;font-size:12px;border-radius:4px;padding:1px 6px}}
-.ok{{background:#dcf5dc;color:#166016}} .warn{{background:#fff0cc;color:#7a5200}} .bad{{background:#fde0e0;color:#8a1c1c}}
-.info{{background:#e0ecfd;color:#1c4a8a}} .muted{{background:#eee;color:#666}} .stale{{color:#b00;font-weight:600}}
-#q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0}} #q{{width:320px}}
+.ok{{background:var(--ok-bg);color:var(--ok-fg)}} .warn{{background:var(--warn-bg);color:var(--warn-fg)}} .bad{{background:var(--bad-bg);color:var(--bad-fg)}}
+.info{{background:var(--info-bg);color:var(--info-fg)}} .muted{{background:var(--muted-bg);color:var(--muted)}} .stale{{color:var(--red);font-weight:600}}
+#q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
 .summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
-.summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:#e6e6e6}} .summary th.on::after{{content:" ↓";color:#666}} .summary th.on.asc::after{{content:" ↑"}}
-#count{{color:#666}}
+.summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
+#count{{color:var(--muted)}}
 .mrepo{{display:none}}
-.fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:#b00;font-weight:600}} .ci-wait{{color:#7a5200}} .ci-ok{{color:#166016}}
-.gstat .cf{{color:#b00}}
-nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:#e6e6e6;border-radius:4px}} nav.pages a{{padding:2px 8px}}
+.fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:var(--red);font-weight:600}} .ci-wait{{color:var(--warn-fg)}} .ci-ok{{color:var(--ok-fg)}}
+.gstat .cf{{color:var(--red)}}
+nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:var(--head-hover);border-radius:4px}} nav.pages a{{padding:2px 8px}}
+#theme{{float:right;font-size:12px;padding:2px 8px;cursor:pointer;background:var(--input-bg);color:var(--muted);border:1px solid var(--input-bd);border-radius:4px}}
 @media (max-width:700px){{
   body{{margin:12px auto;padding:0 10px;font-size:13px}}
   h1{{font-size:17px}} .meta{{font-size:12px}}
@@ -334,12 +348,13 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
   td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6){{padding:0;font-size:0;overflow:hidden}}
   .c-num{{width:56px}} .c-st{{width:88px}} .c-n:nth-child(7){{width:64px}} .prs th{{font-size:12px}}
   .st{{white-space:normal;font-size:11px}}
-  .mrepo{{color:#888;font-size:11px}}
+  .mrepo{{color:var(--faint);font-size:11px}}
   .lbl{{font-size:10px;margin-top:1px}} .prs td.title div{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
   .mrepo{{display:block;margin:0}}
   tr.grp td{{font-size:14px}}
 }}
 </style></head><body>
+<button id="theme" title="theme: auto / light / dark">◐ auto</button>
 <h1>{e(title)}</h1>
 {navhtml}<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
 <select id="repo"><option value="">all repos</option>{options}</select>
@@ -384,13 +399,24 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     }});
     ths.forEach(function(t){{t.classList.toggle('on',t.dataset.k===sortKey);t.classList.toggle('asc',sortAsc);}});
     sum.innerHTML=logins.map(function(l){{var p=per[l];
-      var c=OPEN?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td>'+p.rp+'</td><td>'+p.ad+'d</td>';
+      var c=OPEN?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td class="rp">'+p.rp+'</td><td>'+p.ad+'d</td>';
       return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td>'+c+'</tr>';}}).join('');
     cnt.textContent=shown+' PRs · '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
   }}
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
   q.addEventListener('input',apply); sel.addEventListener('change',apply); apply();
+
+  var tb=document.getElementById('theme'), modes=['auto','light','dark'], icons={{auto:'◐',light:'☀',dark:'☾'}};
+  function cur(){{return document.documentElement.getAttribute('data-theme')||'auto';}}
+  function show(){{tb.textContent=icons[cur()]+' '+cur();}}
+  tb.addEventListener('click',function(){{
+    var n=modes[(modes.indexOf(cur())+1)%3];
+    if(n==='auto'){{document.documentElement.removeAttribute('data-theme');}} else {{document.documentElement.setAttribute('data-theme',n);}}
+    try{{n==='auto'?localStorage.removeItem('cprs.theme'):localStorage.setItem('cprs.theme',n);}}catch(e){{}}
+    show();
+  }});
+  show();
 
 }})();
 </script></body></html>'''
