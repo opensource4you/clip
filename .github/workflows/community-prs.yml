@@ -1,0 +1,61 @@
+# 每兩小時列出社群成員在各專案的 PR，發佈到 GitHub Pages。
+# 一次性設定：repo Settings -> Pages -> Source 選 "GitHub Actions"。
+#   https://opensource4you.github.io/clip/             open PRs
+#   https://opensource4you.github.io/clip/merged.html  最近 30 天 merged
+
+name: community-prs
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"     # UTC
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - github/community_prs.py
+      - github/people_all.json
+      - .github/workflows/community-prs.yml
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: community-prs
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}   # runner 內建 gh，只需要這個
+    defaults:
+      run:
+        working-directory: github
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build pages
+        run: |
+          mkdir -p site
+          python3 community_prs.py --people-file people_all.json --no-cache \
+            --out site/index.html
+          python3 community_prs.py --people-file people_all.json --no-cache \
+            --state merged --since "$(date -u -d '30 days ago' +%F)" \
+            --out site/merged.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: github/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
