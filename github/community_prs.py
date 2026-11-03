@@ -228,10 +228,10 @@ def render(result, repos, state, since, dispatch=None):
     for login, prs in sorted(result.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
         if not prs:
             continue
-        prs = sorted(prs, key=lambda p: p["updatedAt"], reverse=True)
+        prs = sorted(prs, key=lambda p: p["updatedAt"], reverse=(state != "open"))
         body.append(
             f'<tr class="grp" id="u-{e(login)}" data-login="{e(login)}"><td colspan="7">'
-            f'<a href="https://github.com/{e(login)}" target="_blank">{e(login)}</a> <small></small></td></tr>')
+            f'<a href="https://github.com/{e(login)}" target="_blank">{e(login)}</a> <small></small> <span class="gstat"></span></td></tr>')
         for p in prs:
             lab, cls = review_label(p)
             repo = p["repository"]["nameWithOwner"]
@@ -250,39 +250,46 @@ def render(result, repos, state, since, dispatch=None):
                 f'</tr>')
     main_table = ('<table class="prs"><colgroup><col class="c-repo"><col class="c-num"><col class="c-title">'
                   '<col class="c-st"><col class="c-n"><col class="c-n"><col class="c-n"></colgroup>'
-                  '<thead><tr><th>repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
+                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
                   '<th class="n">opened</th><th class="n">updated</th></tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
 
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>{e(title)}</title>
 <style>
-body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;color:#222;background:#fafafa}}
+body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;padding:0 24px;max-width:1500px;color:#222;background:#fafafa}}
+body.onerepo .c-repo{{width:0}} body.onerepo td.repo,body.onerepo th.repo{{padding:0;font-size:0;overflow:hidden}}
 h1{{font-size:20px;margin:0 0 4px}} .meta{{color:#666;margin-bottom:16px}}
 table{{border-collapse:collapse;width:100%;background:#fff}} th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #e5e5e5;vertical-align:top}}
 th{{background:#f0f0f0;font-weight:600}} th.n,td.n{{text-align:right;white-space:nowrap}} td.repo{{color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
 .prs{{table-layout:fixed;margin-top:20px}} .prs thead th{{position:sticky;top:0;z-index:1}}
 .c-repo{{width:150px}} .c-num{{width:70px}} .c-st{{width:150px}} .c-n{{width:70px}}
 .prs td.title{{overflow-wrap:anywhere}}
-tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:#888;font-weight:normal}}
+tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:#888;font-weight:normal}} .gstat{{font-weight:normal;font-size:12px;margin-left:10px}} .gstat b{{font-weight:600;margin-right:10px}} .gstat .nr{{color:#8a1c1c}} .gstat .sl{{color:#b00}}
 .lbl{{display:inline-block;font-size:11px;background:#eef;color:#336;border-radius:10px;padding:0 7px;margin:2px 4px 0 0}}
 .st{{white-space:nowrap;font-size:12px;border-radius:4px;padding:1px 6px}}
 .ok{{background:#dcf5dc;color:#166016}} .warn{{background:#fff0cc;color:#7a5200}} .bad{{background:#fde0e0;color:#8a1c1c}}
 .info{{background:#e0ecfd;color:#1c4a8a}} .muted{{background:#eee;color:#666}} .stale{{color:#b00;font-weight:600}}
 #q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0}} #q{{width:320px}}
-.summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2){{text-align:right}}
+.summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
+.summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:#e6e6e6}} .summary th.on::after{{content:" ↓";color:#666}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:#666}}
 </style></head><body>
 <h1>{e(title)}</h1>
-<div class="meta">{e(", ".join(repos))} · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
+<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
-<table class="summary"><thead><tr><th>login</th><th>PRs</th><th>no review</th><th>stale ≥14d</th></tr></thead><tbody id="sum"></tbody></table>
+<table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th><th data-k="nr">no review</th><th data-k="st">stale ≥14d</th></tr></thead><tbody id="sum"></tbody></table>
 {main_table}
 <script>
 (function(){{
   var q=document.getElementById('q'), sel=document.getElementById('repo'), sum=document.getElementById('sum'), cnt=document.getElementById('count');
   var rows=Array.prototype.slice.call(document.querySelectorAll('tr.pr'));
+  var ths=Array.prototype.slice.call(document.querySelectorAll('.summary th')), sortKey='n', sortAsc=false;
+  ths.forEach(function(t){{t.addEventListener('click',function(){{
+    if(sortKey===t.dataset.k) sortAsc=!sortAsc; else {{sortKey=t.dataset.k; sortAsc=(sortKey==='login');}}
+    apply();
+  }});}});
   function apply(){{
     var v=q.value.toLowerCase(), repo=sel.value, per={{}}, shown=0;
     rows.forEach(function(r){{
@@ -293,11 +300,18 @@ tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-we
       var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0}});
       p.n++; if(r.dataset.status==='no review yet') p.nr++; if(r.dataset.stale==='1') p.st++;
     }});
+    document.body.classList.toggle('onerepo',!!repo);
     document.querySelectorAll('tr.grp').forEach(function(g){{
-      var n=(per[g.dataset.login]||{{n:0}}).n;
-      g.style.display=n?'':'none'; g.querySelector('small').textContent=n;
+      var p=per[g.dataset.login]||{{n:0,nr:0,st:0}};
+      g.style.display=p.n?'':'none'; g.querySelector('small').textContent=p.n;
+      g.querySelector('.gstat').innerHTML=(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' stale</b>':'');
     }});
-    var logins=Object.keys(per).sort(function(a,b){{return per[b].n-per[a].n||a.toLowerCase().localeCompare(b.toLowerCase());}});
+    var logins=Object.keys(per).sort(function(a,b){{
+      var d=sortKey==='login'?a.toLowerCase().localeCompare(b.toLowerCase()):per[a][sortKey]-per[b][sortKey];
+      if(!sortAsc)d=-d;
+      return d||a.toLowerCase().localeCompare(b.toLowerCase());
+    }});
+    ths.forEach(function(t){{t.classList.toggle('on',t.dataset.k===sortKey);t.classList.toggle('asc',sortAsc);}});
     sum.innerHTML=logins.map(function(l){{var p=per[l];return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td><td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td></tr>';}}).join('');
     cnt.textContent=shown+' PRs · '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
