@@ -192,9 +192,31 @@ def review_label(pr):
     return "in review", "info"
 
 
-def render(result, repos, state, since):
+def dispatch_target(cli):
+    """(owner/repo, workflow file) for the page's refresh link.
+    --dispatch owner/repo:file.yml, or auto-detected inside GitHub Actions."""
+    if cli:
+        repo, _, wf = cli.partition(":")
+        return (repo, wf) if repo and wf else None
+    ref = os.environ.get("GITHUB_WORKFLOW_REF", "")   # owner/repo/.github/workflows/x.yml@refs/heads/main
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    if ref and repo and "/.github/workflows/" in ref:
+        return repo, ref.split("/.github/workflows/")[1].split("@")[0]
+    return None
+
+
+def render(result, repos, state, since, dispatch=None):
     e = html.escape
-    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    try:
+        from zoneinfo import ZoneInfo
+        now = dt.datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M (Taipei)")
+    except Exception:
+        now = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    refresh = ""
+    if dispatch:
+        repo, wf = dispatch
+        refresh = (f' · <a href="https://github.com/{e(repo)}/actions/workflows/{e(wf)}" target="_blank" '
+                   f'title="Run workflow there to refresh this page">&#8635; refresh via Actions</a>')
     title = f"Community PRs ({state}{', since ' + since if since else ''})"
     total = sum(len(v) for v in result.values())
     stale_key = "updatedAt"
@@ -202,41 +224,46 @@ def render(result, repos, state, since):
     seen_repos = sorted({p["repository"]["nameWithOwner"] for prs in result.values() for p in prs}, key=str.lower)
     options = "".join(f'<option value="{e(r)}">{e(r)}</option>' for r in seen_repos)
 
-    sections = []
+    body = []
     for login, prs in sorted(result.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
         if not prs:
             continue
         prs = sorted(prs, key=lambda p: p["updatedAt"], reverse=True)
-        rows = []
+        body.append(
+            f'<tr class="grp" id="u-{e(login)}" data-login="{e(login)}"><td colspan="7">'
+            f'<a href="https://github.com/{e(login)}" target="_blank">{e(login)}</a> <small></small></td></tr>')
         for p in prs:
             lab, cls = review_label(p)
             repo = p["repository"]["nameWithOwner"]
             stale = p["state"] == "OPEN" and days_ago(p[stale_key]) >= 14
             labels = " ".join(f'<span class="lbl">{e(l["name"])}</span>' for l in p["labels"]["nodes"])
-            rows.append(
+            body.append(
                 f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" '
                 f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)}">'
-                f'<td class="repo">{e(repo)}</td>'
-                f'<td><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
-                f'<td>{e(p["title"])}<div>{labels}</div></td>'
+                f'<td class="repo">{e(repo.split("/")[-1])}</td>'
+                f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
+                f'<td class="title">{e(p["title"])}<div>{labels}</div></td>'
                 f'<td><span class="st {cls}">{e(lab)}</span></td>'
                 f'<td class="n">{p["comments"]["totalCount"]}</td>'
                 f'<td class="n">{days_ago(p["createdAt"])}d</td>'
-                f'<td class="n{" stale" if p["state"] == "OPEN" and days_ago(p["updatedAt"]) >= 14 else ""}">{days_ago(p["updatedAt"])}d</td>'
+                f'<td class="n{" stale" if stale else ""}">{days_ago(p["updatedAt"])}d</td>'
                 f'</tr>')
-        sections.append(
-            f'<section id="u-{e(login)}"><h2><a href="https://github.com/{e(login)}" target="_blank">{e(login)}</a> '
-            f'<small>{len(prs)}</small></h2><table><thead><tr><th>repo</th><th>#</th><th>title</th>'
-            f'<th>status</th><th>💬</th><th>opened</th><th>updated</th></tr></thead><tbody>'
-            + "".join(rows) + '</tbody></table></section>')
+    main_table = ('<table class="prs"><colgroup><col class="c-repo"><col class="c-num"><col class="c-title">'
+                  '<col class="c-st"><col class="c-n"><col class="c-n"><col class="c-n"></colgroup>'
+                  '<thead><tr><th>repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
+                  '<th class="n">opened</th><th class="n">updated</th></tr></thead><tbody>'
+                  + "".join(body) + '</tbody></table>')
 
     return f'''<!doctype html><html><head><meta charset="utf-8"><title>{e(title)}</title>
 <style>
 body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;color:#222;background:#fafafa}}
 h1{{font-size:20px;margin:0 0 4px}} .meta{{color:#666;margin-bottom:16px}}
-h2{{font-size:16px;margin:28px 0 6px}} h2 small{{color:#888;font-weight:normal}}
 table{{border-collapse:collapse;width:100%;background:#fff}} th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid #e5e5e5;vertical-align:top}}
-th{{background:#f0f0f0;font-weight:600}} td.n{{text-align:right;white-space:nowrap}} td.repo{{color:#666;white-space:nowrap}}
+th{{background:#f0f0f0;font-weight:600}} th.n,td.n{{text-align:right;white-space:nowrap}} td.repo{{color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
+.prs{{table-layout:fixed;margin-top:20px}} .prs thead th{{position:sticky;top:0;z-index:1}}
+.c-repo{{width:150px}} .c-num{{width:70px}} .c-st{{width:150px}} .c-n{{width:70px}}
+.prs td.title{{overflow-wrap:anywhere}}
+tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:#888;font-weight:normal}}
 .lbl{{display:inline-block;font-size:11px;background:#eef;color:#336;border-radius:10px;padding:0 7px;margin:2px 4px 0 0}}
 .st{{white-space:nowrap;font-size:12px;border-radius:4px;padding:1px 6px}}
 .ok{{background:#dcf5dc;color:#166016}} .warn{{background:#fff0cc;color:#7a5200}} .bad{{background:#fde0e0;color:#8a1c1c}}
@@ -246,12 +273,12 @@ th{{background:#f0f0f0;font-weight:600}} td.n{{text-align:right;white-space:nowr
 #count{{color:#666}}
 </style></head><body>
 <h1>{e(title)}</h1>
-<div class="meta">{e(", ".join(repos))} · {len(result)} people · {total} PRs · generated {now}</div>
+<div class="meta">{e(", ".join(repos))} · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
 <table class="summary"><thead><tr><th>login</th><th>PRs</th><th>no review</th><th>stale ≥14d</th></tr></thead><tbody id="sum"></tbody></table>
-{"".join(sections)}
+{main_table}
 <script>
 (function(){{
   var q=document.getElementById('q'), sel=document.getElementById('repo'), sum=document.getElementById('sum'), cnt=document.getElementById('count');
@@ -266,9 +293,9 @@ th{{background:#f0f0f0;font-weight:600}} td.n{{text-align:right;white-space:nowr
       var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0}});
       p.n++; if(r.dataset.status==='no review yet') p.nr++; if(r.dataset.stale==='1') p.st++;
     }});
-    document.querySelectorAll('section').forEach(function(s){{
-      var n=s.querySelectorAll('tr.pr:not([style*="none"])').length;
-      s.style.display=n?'':'none'; s.querySelector('h2 small').textContent=n;
+    document.querySelectorAll('tr.grp').forEach(function(g){{
+      var n=(per[g.dataset.login]||{{n:0}}).n;
+      g.style.display=n?'':'none'; g.querySelector('small').textContent=n;
     }});
     var logins=Object.keys(per).sort(function(a,b){{return per[b].n-per[a].n||a.toLowerCase().localeCompare(b.toLowerCase());}});
     sum.innerHTML=logins.map(function(l){{var p=per[l];return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td><td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td></tr>';}}).join('');
@@ -277,6 +304,7 @@ th{{background:#f0f0f0;font-weight:600}} td.n{{text-align:right;white-space:nowr
   }}
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
   q.addEventListener('input',apply); sel.addEventListener('change',apply); apply();
+
 }})();
 </script></body></html>'''
 
@@ -293,6 +321,8 @@ def main():
     ap.add_argument("--cache-dir", default=CACHE_DIR,
                     help=f"where raw results are kept (default {CACHE_DIR}, env COMMUNITY_PRS_CACHE)")
     ap.add_argument("--no-cache", action="store_true", help="neither read nor write the cache")
+    ap.add_argument("--dispatch", metavar="OWNER/REPO:FILE.yml",
+                    help="add a link to this workflow's Actions page for manual refresh; auto-detected inside GitHub Actions")
     ap.add_argument("--max-age", type=int, default=0, metavar="MIN",
                     help="reuse cached results younger than MIN minutes (0 = always fetch)")
     args = ap.parse_args()
@@ -326,7 +356,7 @@ def main():
             os.replace(tmp, cache_path)
 
     with open(args.out, "w") as f:
-        f.write(render(result, repos, args.state, args.since))
+        f.write(render(result, repos, args.state, args.since, dispatch_target(args.dispatch)))
     total = sum(len(v) for v in result.values())
     print(f"{total} PRs from {len(people)} people -> {args.out}")
 
