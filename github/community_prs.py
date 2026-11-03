@@ -242,7 +242,7 @@ def render(result, repos, state, since, dispatch=None):
                 f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
-                f'<td class="title">{e(p["title"])}<div>{labels}</div></td>'
+                f'<td class="title"><span class="mrepo">{e(repo.split("/")[-1])}</span>{e(p["title"])}<div>{labels}</div></td>'
                 f'<td><span class="st {cls}">{e(lab)}</span></td>'
                 f'<td class="n">{p["comments"]["totalCount"]}</td>'
                 f'<td class="n">{days_ago(p["createdAt"])}d</td>'
@@ -254,7 +254,7 @@ def render(result, repos, state, since, dispatch=None):
                   '<th class="n">opened</th><th class="n">updated</th></tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
 
-    return f'''<!doctype html><html><head><meta charset="utf-8"><title>{e(title)}</title>
+    return f'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{e(title)}</title>
 <style>
 body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;padding:0 24px;max-width:1500px;color:#222;background:#fafafa}}
 body.onerepo .c-repo{{width:0}} body.onerepo td.repo,body.onerepo th.repo{{padding:0;font-size:0;overflow:hidden}}
@@ -273,6 +273,21 @@ tr.grp td{{background:#f7f7f7;border-top:2px solid #ddd;padding-top:14px;font-we
 .summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:#e6e6e6}} .summary th.on::after{{content:" ↓";color:#666}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:#666}}
+.mrepo{{display:none}}
+@media (max-width:700px){{
+  body{{margin:12px auto;padding:0 10px;font-size:13px}}
+  h1{{font-size:17px}} .meta{{font-size:12px}}
+  #repo,#q{{width:100%;box-sizing:border-box;margin:0 0 8px}} #count{{display:block;margin-bottom:8px;font-size:12px}}
+  .summary{{width:100%;min-width:0}}
+  th,td{{padding:5px 6px}}
+  .c-repo,.c-n:nth-child(5),.c-n:nth-child(6){{width:0}}
+  td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6){{padding:0;font-size:0;overflow:hidden}}
+  .c-num{{width:56px}} .c-st{{width:88px}} .c-n:nth-child(7){{width:64px}} .prs th{{font-size:12px}}
+  .st{{white-space:normal;font-size:11px}}
+  .mrepo{{display:inline-block;color:#888;font-size:11px;margin-right:6px}}
+  .lbl{{font-size:10px}}
+  tr.grp td{{font-size:14px}}
+}}
 </style></head><body>
 <h1>{e(title)}</h1>
 <div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
