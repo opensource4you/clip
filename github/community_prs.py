@@ -249,8 +249,13 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
 
     sumcols = ('<th data-k="nr">no review</th><th data-k="st">stale ≥14d</th>' if openmode else
                '<th data-k="rp" title="distinct repos">repos</th><th data-k="ad" title="average days from open to merge">avg days</th>')
-    seen_repos = sorted({p["repository"]["nameWithOwner"] for prs in result.values() for p in prs}, key=str.lower)
-    options = "".join(f'<option value="{e(r)}">{e(r)}</option>' for r in seen_repos)
+    # dropdown lists every configured repo; ones without PRs in this page are marked
+    counts = {}
+    for prs in result.values():
+        for p in prs:
+            counts[p["repository"]["nameWithOwner"]] = counts.get(p["repository"]["nameWithOwner"], 0) + 1
+    all_repos = sorted(set(repos) | set(counts), key=str.lower)
+    options = "".join(f'<option value="{e(r)}">{e(r)}{"" if counts.get(r) else " (0)"}</option>' for r in all_repos)
 
     body = []
     for login, prs in sorted(result.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
