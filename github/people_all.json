@@ -163,6 +163,6 @@
     "kubernetes-sigs/kueue",
     "kubernetes-sigs/dra-driver-nvidia-gpu",
     "ray-project/ray",
-    "ray-project/kuberay"
+    "kuberay-project/kuberay"
   ]
 }
