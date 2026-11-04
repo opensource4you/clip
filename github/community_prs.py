@@ -356,7 +356,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 </style></head><body>
 <button id="theme" title="theme: auto / light / dark">◐ auto</button>
 <h1>{e(title)}</h1>
-{navhtml}<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · {len(result)} people · {total} PRs · generated {now}{refresh}</div>
+{navhtml}<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · generated {now}{refresh}</div>
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
@@ -401,7 +401,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     sum.innerHTML=logins.map(function(l){{var p=per[l];
       var c=OPEN?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td class="rp">'+p.rp+'</td><td>'+p.ad+'d</td>';
       return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td>'+c+'</tr>';}}).join('');
-    cnt.textContent=shown+' PRs · '+logins.length+' people';
+    cnt.textContent=shown+' PRs from '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
   }}
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
