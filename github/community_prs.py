@@ -403,14 +403,14 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
 :root[data-theme="dark"]{{--bg:#111418;--fg:#e4e6ea;--muted:#9aa0a8;--faint:#7c838c;--panel:#1a1e24;--head:#232931;--head-hover:#2c333d;--grp:#20252c;--line:#2a3039;--line2:#3a414b;
   --link:#7ab3ff;--lbl-bg:#263048;--lbl-fg:#b7c6ef;--ok-bg:#1b3a22;--ok-fg:#8fdc9a;--warn-bg:#3d3112;--warn-fg:#f0c86a;--bad-bg:#45201f;--bad-fg:#ff9b94;
   --info-bg:#1d3150;--info-fg:#9cc3ff;--muted-bg:#2b3037;--red:#ff7b72;--input-bg:#1a1e24;--input-bd:#3a414b;color-scheme:dark}}
-body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;padding:0 24px;max-width:1500px;color:var(--fg);background:var(--bg)}}
+body{{font:14px/1.45 -apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px auto;padding:0 24px;max-width:1900px;color:var(--fg);background:var(--bg)}}
 a{{color:var(--link)}}
 body.onerepo .c-repo{{width:0}} body.onerepo td.repo,body.onerepo th.repo{{padding:0;font-size:0;overflow:hidden}}
 body.onerepo .summary th[data-k="rp"],body.onerepo .summary td.rp{{display:none}}
 h1{{font-size:20px;margin:0 0 4px}} .meta{{color:var(--muted);margin-bottom:16px}}
 table{{border-collapse:collapse;width:100%;background:var(--panel)}} th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}}
 th{{background:var(--head);font-weight:600}} th.n,td.n{{text-align:right;white-space:nowrap}} td.repo{{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.prs{{table-layout:fixed;margin-top:20px}} .prs thead th{{position:sticky;top:0;z-index:1}}
+.prs{{table-layout:fixed}} .prs thead th{{position:sticky;top:0;z-index:1}}
 .c-repo{{width:150px}} .c-num{{width:70px}} .c-st{{width:150px}} .c-n{{width:70px}}
 .prs td.title{{overflow-wrap:anywhere}}
 tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:var(--faint);font-weight:normal}} .gstat{{font-weight:normal;font-size:12px;margin-left:10px}} .gstat b{{font-weight:600;margin-right:10px}} .gstat .nr{{color:var(--bad-fg)}} .gstat .sl{{color:var(--red)}}
@@ -419,7 +419,11 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 .ok{{background:var(--ok-bg);color:var(--ok-fg)}} .warn{{background:var(--warn-bg);color:var(--warn-fg)}} .bad{{background:var(--bad-bg);color:var(--bad-fg)}}
 .info{{background:var(--info-bg);color:var(--info-fg)}} .muted{{background:var(--muted-bg);color:var(--muted)}} .stale{{color:var(--red);font-weight:600}}
 #q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
-.summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
+.layout{{display:grid;grid-template-columns:minmax(300px,380px) minmax(0,1fr);gap:20px;align-items:start}}
+.side{{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto}}
+.side .summary thead th{{position:sticky;top:0;z-index:1}}
+tr.grp{{scroll-margin-top:40px}}
+.summary{{width:100%}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
 .mrepo{{display:none}}
@@ -428,6 +432,9 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 .gstat .cf{{color:var(--red)}}
 nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:var(--head-hover);border-radius:4px}} nav.pages a{{padding:2px 8px}}
 #theme{{float:right;font-size:12px;padding:2px 8px;cursor:pointer;background:var(--input-bg);color:var(--muted);border:1px solid var(--input-bd);border-radius:4px}}
+@media (max-width:1000px){{
+  .layout{{display:block}} .side{{position:static;max-height:none;overflow:visible;margin-bottom:20px}}
+}}
 @media (max-width:700px){{
   body{{margin:12px auto;padding:0 10px;font-size:13px}}
   h1{{font-size:17px}} .meta{{font-size:12px}}
@@ -450,8 +457,10 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
-<table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table>
-{main_table}
+<div class="layout">
+<aside class="side"><table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table></aside>
+<main>{main_table}</main>
+</div>
 <script>
 (function(){{
   var OPEN={"true" if openmode else "false"};
