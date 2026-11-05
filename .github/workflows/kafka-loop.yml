@@ -28,7 +28,7 @@ on:
         description: 每個容器跑幾次
         default: "20"
       parallel:
-        description: 同時開幾個容器（每個佔一台機器；community-vm 目前只有 3 個 runner）
+        description: 同時開幾個容器（1 到 10，每個佔一台機器；community-vm 目前只有 3 個 runner）
         default: "3"
       runner:
         description: 在哪裡跑：github（GitHub 的機器，免費，一個 job 最多 6 小時）或 community-vm（社群 VM）
@@ -61,7 +61,7 @@ jobs:
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
-          [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 20 ]] || { echo "::error::parallel 要在 1..20"; exit 1; }
+          [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 10 ]] || { echo "::error::parallel 要在 1..10"; exit 1; }
       - id: ids
         run: echo "ids=$(seq -s, 1 "$PARALLEL" | sed 's/.*/[&]/')" >> "$GITHUB_OUTPUT"
 
@@ -71,6 +71,8 @@ jobs:
     timeout-minutes: ${{ inputs.runner == 'community-vm' && 720 || 350 }}
     strategy:
       fail-fast: false
+      # GitHub 免費方案整個 org 同時最多 20 個 job，留一半給 community-prs 和其他 repo
+      max-parallel: 10
       matrix:
         id: ${{ fromJSON(needs.setup.outputs.ids) }}
     name: loop c${{ matrix.id }}
