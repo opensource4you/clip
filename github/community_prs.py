@@ -267,6 +267,30 @@ def ball(pr):
     return whose, since
 
 
+def last_reviewed(pr):
+    """When someone other than the author last reviewed or commented (ISO), "?" if that is
+    older than the fetched timeline, or None if nobody has. Bots are ignored."""
+    tl = pr.get("timelineItems")
+    if not tl:
+        return None
+    me = ((pr.get("author") or {}).get("login") or "").lower()
+    last = None
+    for n in tl["nodes"]:
+        if not n or n.get("__typename") == "PullRequestCommit":
+            continue
+        a = n.get("author") or {}
+        login = (a.get("login") or "").lower()
+        if not login or login == me or a.get("__typename") == "Bot" or login.endswith("[bot]"):
+            continue
+        when = n.get("submittedAt") or n.get("createdAt")
+        if when and (last is None or when > last):
+            last = when
+    if last is None and tl.get("filteredCount", 0) > len(tl["nodes"]) and \
+            (pr["reviews"]["totalCount"] or pr["comments"]["totalCount"]):
+        return "?"
+    return last
+
+
 def dispatch_target(cli):
     """(owner/repo, workflow file) for the page's refresh link.
     --dispatch owner/repo:file.yml, or auto-detected inside GitHub Actions."""
@@ -324,6 +348,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                '<option value="reviewer">waiting on reviewer</option>'
                '<option value="author">waiting on author</option></select>') if openmode else ""
 
+    ncols = 8 if openmode else 7
     body = []
     for login, prs in sorted(result.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
         if not prs:
@@ -340,7 +365,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
         else:
             prs = sorted(prs, key=lambda p: p["updatedAt"], reverse=True)
         body.append(
-            f'<tr class="grp" id="u-{e(login)}" data-login="{e(login)}"><td colspan="7">'
+            f'<tr class="grp" id="u-{e(login)}" data-login="{e(login)}"><td colspan="{ncols}">'
             f'<a href="https://github.com/{e(login)}" target="_blank">{e(login)}</a> <small></small> <span class="gstat"></span></td></tr>')
         for p in prs:
             lab, cls = review_label(p)
@@ -375,14 +400,29 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                     flags.append('<span class="fl conflict" title="has merge conflicts, needs rebase">⚠ conflict</span>'); ftext.append("conflict")
             conflict = int(p.get("mergeable") == "CONFLICTING" and p["state"] == "OPEN")
             days = took(p)
+            # numbers the page sorts on (within each person's group)
+            sk = {"wait": wait if whose in ("reviewer", "merge") else (-1 if whose else -2),
+                  "cm": p["comments"]["totalCount"]}
             if openmode:
-                tail = (f'<td class="n">{days_ago(p["createdAt"])}d</td>'
-                        f'<td class="n">{days_ago(p["updatedAt"])}d</td>')
+                sk["op"], sk["up"] = days_ago(p["createdAt"]), days_ago(p["updatedAt"])
+                lr = last_reviewed(p)
+                if lr is None:
+                    sk["lr"], lrcell = 99999, '<td class="n" title="nobody but the author has reviewed or commented">—</td>'
+                elif lr == "?":
+                    sk["lr"], lrcell = 99998, f'<td class="n" title="no review or comment in the last {TIMELINE} timeline events">old</td>'
+                else:
+                    sk["lr"], lrcell = days_ago(lr), f'<td class="n">{days_ago(lr)}d</td>'
+                if p["isDraft"]:
+                    sk["lr"] = -1   # drafts are not waiting on anyone, keep them last
+                tail = (f'<td class="n">{sk["op"]}d</td>'
+                        f'<td class="n">{sk["up"]}d</td>' + lrcell)
             else:
                 end = p.get("mergedAt") or p["updatedAt"]
+                sk["op"], sk["up"] = days, days_ago(end)
                 tail = f'<td class="n">{days}d</td><td class="n">{days_ago(end)}d</td>'
+            skattr = " ".join(f'data-{k}="{v}"' for k, v in sk.items())
             body.append(
-                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" data-ball="{"reviewer" if whose == "merge" else whose}" '
+                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" data-ball="{"reviewer" if whose == "merge" else whose}" {skattr} '
                 f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {" ".join(ftext)}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
@@ -391,10 +431,13 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                 f'<td class="n">{p["comments"]["totalCount"]}</td>'
                 + tail + '</tr>')
     main_table = ('<table class="prs"><colgroup><col class="c-repo"><col class="c-num"><col class="c-title">'
-                  '<col class="c-st"><col class="c-n"><col class="c-n"><col class="c-n"></colgroup>'
-                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
-                  + ('<th class="n">opened</th><th class="n">updated</th>' if openmode else
-                     '<th class="n" title="days from open to merge">took</th><th class="n" title="merged how long ago">merged</th>')
+                  '<col class="c-st">' + '<col class="c-n">' * (ncols - 4) + '</colgroup>'
+                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th>'
+                  + ('<th data-s="wait" title="sort by how long it has waited on a reviewer or a merge">status</th>' if openmode else '<th>status</th>')
+                  + '<th class="n" data-s="cm" title="comments">💬</th>'
+                  + ('<th class="n" data-s="op">opened</th><th class="n" data-s="up">updated</th>'
+                     '<th class="n" data-s="lr" title="days since someone other than the author last reviewed or commented">reviewed</th>' if openmode else
+                     '<th class="n" data-s="op" title="days from open to merge">took</th><th class="n" data-s="up" title="merged how long ago">merged</th>')
                   + '</tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
 
@@ -429,6 +472,7 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 #q,#repo,#ball{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
 .summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
+.prs th[data-s]{{cursor:pointer;user-select:none}} .prs th[data-s]:hover{{background:var(--head-hover)}} .prs th.on::after{{content:" ↓";color:var(--muted)}} .prs th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
 .mrepo{{display:none}}
 .fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:var(--red);font-weight:600}} .ci-wait{{color:var(--warn-fg)}} .ci-ok{{color:var(--ok-fg)}}
@@ -442,8 +486,8 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
   #repo,#ball,#q{{width:100%;box-sizing:border-box;margin:0 0 8px}} #count{{display:block;margin-bottom:8px;font-size:12px}}
   .summary{{width:100%;min-width:0}}
   th,td{{padding:5px 6px}}
-  .c-repo,.c-n:nth-child(5),.c-n:nth-child(6){{width:0}}
-  td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6){{padding:0;font-size:0;overflow:hidden}}
+  .c-repo,.c-n:nth-child(5),.c-n:nth-child(6),.c-n:nth-child(8){{width:0}}
+  td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6),.prs td:nth-child(8),.prs th:nth-child(8){{padding:0;font-size:0;overflow:hidden}}
   .c-num{{width:56px}} .c-st{{width:88px}} .c-n:nth-child(7){{width:64px}} .prs th{{font-size:12px}}
   .st{{white-space:normal;font-size:11px}}
   .mrepo{{color:var(--faint);font-size:11px}}
@@ -502,6 +546,27 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     cnt.textContent=shown+' PRs from '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
   }}
+  // PR table: clicking a header sorts the rows inside each person's group
+  var ptb=document.querySelector('.prs tbody'), pths=Array.prototype.slice.call(document.querySelectorAll('.prs th[data-s]'));
+  var pKey=OPEN?'wait':'', pAsc=false;
+  Array.prototype.slice.call(ptb.querySelectorAll('tr.pr')).forEach(function(r,i){{r.dataset.i=i;}});
+  function psort(){{
+    var groups=[], g=null;
+    Array.prototype.slice.call(ptb.children).forEach(function(r){{
+      if(r.classList.contains('grp')){{g={{h:r,rows:[]}};groups.push(g);}} else if(g) g.rows.push(r);
+    }});
+    groups.forEach(function(g){{
+      if(pKey) g.rows.sort(function(a,b){{var d=(+a.dataset[pKey])-(+b.dataset[pKey]); if(!pAsc)d=-d; return d||(+a.dataset.i)-(+b.dataset.i);}});
+      ptb.appendChild(g.h); g.rows.forEach(function(r){{ptb.appendChild(r);}});
+    }});
+    pths.forEach(function(t){{t.classList.toggle('on',t.dataset.s===pKey);t.classList.toggle('asc',pAsc);}});
+  }}
+  pths.forEach(function(t){{t.addEventListener('click',function(){{
+    if(pKey===t.dataset.s) pAsc=!pAsc; else {{pKey=t.dataset.s; pAsc=false;}}
+    psort();
+  }});}});
+  psort();
+
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
   q.addEventListener('input',apply); sel.addEventListener('change',apply); if(bsel)bsel.addEventListener('change',apply); apply();
 
