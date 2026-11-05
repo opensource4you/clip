@@ -16,7 +16,7 @@ on:
         description: 分支、tag 或 commit SHA
         default: trunk
       command:
-        description: 在容器內 kafka 目錄執行的指令
+        description: Gradle 指令（./gradlew 開頭，只能有 task、--tests、-x、-Pkey=value 和常用 flag）
         default: ./gradlew clean metadata:test
       jdk:
         description: eclipse-temurin 映像檔 tag
@@ -44,9 +44,14 @@ jobs:
       REVISION: ${{ inputs.revision }}
       LOOPS: ${{ inputs.loops }}
       PARALLEL: ${{ inputs.parallel }}
+      COMMAND: ${{ inputs.command }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: kafka
       - name: Validate inputs
         run: |
+          bash kafka/check_gradle_command.sh "$COMMAND"
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
@@ -101,7 +106,7 @@ jobs:
               -v "$PWD/kafka:/tmp/kafka:z" \
               -v "$GRADLE_CACHE_DIR:/root/.gradle:z" \
               "$IMAGE" \
-              bash -c 'cd /tmp/kafka && chmod +x ./gradlew && eval "$COMMAND"'
+              bash -c 'set -f; read -ra cmd <<< "$COMMAND"; cd /tmp/kafka && chmod +x ./gradlew && "${cmd[@]}"'
             rc=$?
             echo "::endgroup::"
             python3 clip/kafka/junit_failures.py kafka | sed "s/^/$i /" >> out/failures.txt
