@@ -1,15 +1,24 @@
 # Self-hosted runner（社群 VM）
 
-`kafka-loop` 和 `kafka-e2e` 跑在社群 VM 上。runner 主動往外連 GitHub 拉 job，VM 不用開任何對外 port。
+`kafka-loop`、`kafka-full` 和 `kafka-e2e` 跑在社群 VM 上。runner 主動往外連 GitHub 拉 job，VM 不用開任何對外 port。
 
 | workflow   | runs-on 的 label | 每台 runner 數 | 說明 |
 |------------|------------------|----------------|------|
 | kafka-loop | `kafka`          | 多個           | 一個 runner 跑一個容器，要平行幾個就註冊幾個 |
+| kafka-full | `kafka-full`     | **一個**       | 完整跑一次 JUnit，Gradle 自己平行，吃滿整台機器 |
 | kafka-e2e  | `kafka-e2e`      | **一個**       | e2e 會吃滿整台機器，同時只能跑一個 |
 
 一個 runner 同時只跑一個 job，所以「一台機器同時跑幾個 job」由那台註冊幾個 runner 決定。
-e2e 機器只註冊一個 runner、只給 `kafka-e2e` label，就不會有兩個 e2e 互相砍容器，
-也不會被 loop 擠到。
+要吃滿整台機器的 workflow（full、e2e）只能排在「只註冊一個 runner」的機器上，
+目前做法是 e2e 機器的 runner 同時帶 `kafka-e2e` 和 `kafka-full` 兩個 label：
+同一台一次只會跑其中一個，也不會被 loop 擠到。
+
+已經註冊好的 runner 可以直接加 label，不用重裝（`<ID>` 用下面第一行查）：
+
+```bash
+gh api repos/opensource4you/clip/actions/runners -q '.runners[] | [.id, .name, ([.labels[].name] | join(","))] | @tsv'
+gh api -X POST repos/opensource4you/clip/actions/runners/<ID>/labels -f 'labels[]=kafka-full'
+```
 
 ## 安全設定（clip 是 public repo，務必先做）
 
@@ -28,7 +37,7 @@ e2e 機器只註冊一個 runner、只給 `kafka-e2e` label，就不會有兩個
 
 ## 需要的工具
 
-- 共通：git、python3、zip、podman（rootless 即可）
+- 共通：git、python3、zip、podman（rootless 即可）。loop 和 full 都在 eclipse-temurin 容器裡跑，host 不需要 JDK
 - e2e 另外需要 host 上的 JDK（含 `javac`），因為 build 是在 host 上跑 `./gradlew`。
   - 新版 Kafka 的 ducker-ak 會自動偵測 docker 或 podman，trunk 用 podman 就能跑。
     較舊的分支可能只支援 docker。
@@ -46,7 +55,7 @@ gh api -X POST repos/opensource4you/clip/actions/runners/registration-token -q .
 
 ```bash
 TOKEN=貼上token
-LABEL=kafka   # e2e 機器用 kafka-e2e
+LABEL=kafka   # e2e 機器用 kafka-e2e,kafka-full
 N=3           # e2e 機器用 1
 ARCH=x64      # ARM 機器改成 arm64
 
@@ -55,13 +64,13 @@ sudo loginctl enable-linger "$USER"   # rootless podman 在 systemd service 底�
 
 VER=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p')
 for i in $(seq 1 $N); do
-  d=~/actions-runner-$LABEL-$i
+  d=~/actions-runner-${LABEL%%,*}-$i
   mkdir -p $d && cd $d
   curl -fsSL https://github.com/actions/runner/releases/download/v$VER/actions-runner-linux-$ARCH-$VER.tar.gz | tar xz
   ./config.sh --unattended --replace \
     --url https://github.com/opensource4you/clip \
     --token "$TOKEN" \
-    --name "$(hostname)-$LABEL-$i" \
+    --name "$(hostname)-${LABEL%%,*}-$i" \
     --labels "$LABEL"
   sudo ./svc.sh install "$USER"
   # SELinux 預設不讓 systemd 執行家目錄裡的檔案，要改標籤，不然 service 會 203/EXEC
@@ -75,8 +84,9 @@ done
 
 - Runner 狀態（Idle、Active、Offline、label）：
   https://github.com/opensource4you/clip/settings/actions/runners （只有 admin 看得到）
-- 每次 run 的 log 和 summary，任何人都能看：https://github.com/opensource4you/clip/actions
-- run 頁面下方的 artifact（test report、ducktape results）要登入 GitHub 才能下載，保留 14 天。
+- 每次 run 的 log 和 summary：https://github.com/opensource4you/clip/actions
+- 沒登入只看得到 run 的狀態，log、summary 和 artifact 要登入 GitHub 才能看（任何帳號都可以）。
+  artifact（test report、ducktape results）保留 14 天。
 - 在 VM 上：
   ```bash
   systemctl list-units 'actions.runner.*'

@@ -1,0 +1,117 @@
+# 在社群 VM 上完整跑一次 Kafka 的 JUnit 測試，失敗的測試會重跑（跟官方 CI 一樣用 Gradle 的 test-retry）。
+# 跟 kafka-loop 的差別：loop 是同一組測試跑很多次量失敗率；full 是全部跑一次，分出「真的失敗」和「重跑才過的 flaky」。
+# 整個 job 吃滿一台機器，靠 Gradle 的 maxParallelForks 平行，所以排在只有一個 runner 的 kafka-full 機器上。
+# 觸發：Actions -> kafka-full -> Run workflow（只有對 clip 有 write 權限的人能按）。
+# Runner 設定見 .github/self-hosted-runner.md
+
+name: kafka-full
+run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.tasks }} retry=${{ inputs.retries }} (${{ inputs.jdk }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: GitHub 帳號或組織（例如 apache 或你的帳號）
+        default: apache
+      revision:
+        description: 分支、tag 或 commit SHA
+        default: trunk
+      tasks:
+        description: 要跑的 Gradle task（例如 test，或 core:test streams:test）
+        default: test
+      retries:
+        description: 失敗的測試最多重跑幾次（官方 CI 用 1）
+        type: choice
+        options: ["0", "1", "2", "3"]
+        default: "1"
+      jdk:
+        description: eclipse-temurin 映像檔 tag
+        type: choice
+        options: [17-jdk-jammy, 21-jdk-jammy, 25-jdk-jammy]
+        default: 17-jdk-jammy
+
+permissions:
+  contents: read
+
+jobs:
+  full:
+    runs-on: [self-hosted, linux, kafka-full]
+    timeout-minutes: 600
+    env:
+      ACCOUNT: ${{ inputs.account }}
+      REVISION: ${{ inputs.revision }}
+      TASKS: ${{ inputs.tasks }}
+      RETRIES: ${{ inputs.retries }}
+      IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
+      GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/full-${{ inputs.jdk }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: clip
+          sparse-checkout: kafka
+
+      - name: Validate inputs
+        run: |
+          [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
+          [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
+          bash clip/kafka/check_gradle_command.sh "./gradlew $TASKS"
+          echo "runner: $RUNNER_NAME"
+
+      - name: Fetch kafka
+        run: |
+          rm -rf kafka out && mkdir -p kafka out
+          cd kafka
+          git init -q
+          git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 \
+            "https://github.com/${ACCOUNT}/kafka" "+${REVISION}:tmp"
+          git switch -q tmp
+          git log -1 --format='%H %s'
+
+      - name: Run tests
+        id: tests
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          # 每個測試 fork 最多 3G heap（core），再留 8G 給 Gradle daemon、編譯和系統
+          mem_gb=$(free -g | awk '/^Mem:/{print $2}')
+          forks=$(( (mem_gb - 8) / 3 ))
+          (( forks > $(nproc) )) && forks=$(nproc)
+          (( forks < 1 )) && forks=1
+          echo "cpu $(nproc), mem ${mem_gb}G -> maxParallelForks=$forks"
+          export FORKS=$forks
+          mkdir -p "$GRADLE_CACHE_DIR"
+          podman pull -q "$IMAGE"
+          podman run --rm \
+            -e TASKS -e RETRIES -e FORKS \
+            -v "$PWD/kafka:/tmp/kafka:z" \
+            -v "$GRADLE_CACHE_DIR:/root/.gradle:z" \
+            "$IMAGE" \
+            bash -c 'set -f; read -ra tasks <<< "$TASKS"; cd /tmp/kafka && chmod +x ./gradlew && \
+              ./gradlew --continue \
+                -PmaxParallelForks="$FORKS" \
+                -PmaxTestRetries="$RETRIES" -PmaxTestRetryFailures=10 \
+                "${tasks[@]}"'
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## kafka-full: \`${ACCOUNT}/${REVISION}\`"
+            echo "- tasks: \`${TASKS}\`、retries: ${RETRIES}、jdk: \`${IMAGE##*:}\`"
+            echo "- result: **${{ steps.tests.outcome }}**"
+            python3 clip/kafka/junit_failures.py kafka --summary
+          } >> "$GITHUB_STEP_SUMMARY"
+          (cd kafka && find . -path '*/build/test-results/*' -name 'TEST-*.xml' -print0 \
+            | tar -czf ../out/test-results.tgz --null -T -) || true
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: full-test-results
+          path: out/test-results.tgz
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Mark failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
