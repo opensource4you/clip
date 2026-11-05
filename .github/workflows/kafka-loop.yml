@@ -1,10 +1,11 @@
-# 取代 kafka/kafka_loop.pipeline：在社群 VM（self-hosted runner）上反覆跑 Kafka 測試，抓 flaky。
+# 取代 kafka/kafka_loop.pipeline：反覆跑 Kafka 測試，抓 flaky。
+# 可以選在 GitHub 的機器（免費、平行數多、每個 job 最多 6 小時）或社群 VM（self-hosted runner）上跑。
 # 觸發：Actions -> kafka-loop -> Run workflow（只有對 clip 有 write 權限的人能按）。
 # 結果：run 頁面公開可看；最下面的 report job 會彙整每個失敗測試的次數和重跑指令。
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-loop
-run-name: "loop ${{ inputs.account }}/${{ inputs.revision }} x${{ inputs.loops }} (${{ inputs.jdk }})"
+run-name: "loop ${{ inputs.account }}/${{ inputs.revision }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
 
 on:
   workflow_dispatch:
@@ -27,8 +28,13 @@ on:
         description: 每個容器跑幾次
         default: "20"
       parallel:
-        description: 同時開幾個容器（每個佔一個 runner）
+        description: 同時開幾個容器（每個佔一台機器；community-vm 目前只有 3 個 runner）
         default: "3"
+      runner:
+        description: 在哪裡跑：github（GitHub 的機器，免費，一個 job 最多 6 小時）或 community-vm（社群 VM）
+        type: choice
+        options: [github, community-vm]
+        default: github
 
 permissions:
   contents: read
@@ -55,14 +61,14 @@ jobs:
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
-          [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 10 ]] || { echo "::error::parallel 要在 1..10"; exit 1; }
+          [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 20 ]] || { echo "::error::parallel 要在 1..20"; exit 1; }
       - id: ids
         run: echo "ids=$(seq -s, 1 "$PARALLEL" | sed 's/.*/[&]/')" >> "$GITHUB_OUTPUT"
 
   loop:
     needs: setup
-    runs-on: [self-hosted, linux, kafka]
-    timeout-minutes: 720
+    runs-on: ${{ inputs.runner == 'community-vm' && fromJSON('["self-hosted","linux","kafka"]') || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.runner == 'community-vm' && 720 || 350 }}
     strategy:
       fail-fast: false
       matrix:
@@ -95,13 +101,15 @@ jobs:
       - name: Run ${{ inputs.loops }}x
         run: |
           set -uo pipefail
+          # GitHub 的機器上有 docker 和 podman，社群 VM 只有 podman
+          CR=$(command -v podman || command -v docker)
           mkdir -p "$GRADLE_CACHE_DIR"
-          podman pull -q "$IMAGE"
+          "$CR" pull -q "$IMAGE"
           : > out/failures.txt
           failed=0
           for i in $(seq 1 "$LOOPS"); do
             echo "::group::run $i/$LOOPS"
-            podman run --cpus=3 --rm \
+            "$CR" run --cpus=3 --rm \
               -e COMMAND \
               -v "$PWD/kafka:/tmp/kafka:z" \
               -v "$GRADLE_CACHE_DIR:/root/.gradle:z" \

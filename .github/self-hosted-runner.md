@@ -1,6 +1,6 @@
 # Self-hosted runner（社群 VM）
 
-`kafka-loop`、`kafka-full` 和 `kafka-e2e` 跑在社群 VM 上。runner 主動往外連 GitHub 拉 job，VM 不用開任何對外 port。
+`kafka-e2e` 跑在社群 VM 上；`kafka-loop` 和 `kafka-full` 可以在表單的 `runner` 選 `github`（GitHub 的機器，預設）或 `community-vm`（社群 VM）。下表是選 `community-vm` 時排到的 runner。runner 主動往外連 GitHub 拉 job，VM 不用開任何對外 port。
 
 | workflow   | runs-on 的 label | 每台 runner 數 | 說明 |
 |------------|------------------|----------------|------|

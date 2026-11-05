@@ -1,11 +1,12 @@
-# 在社群 VM 上完整跑一次 Kafka 的 JUnit 測試，失敗的測試會重跑（跟官方 CI 一樣用 Gradle 的 test-retry）。
+# 完整跑一次 Kafka 的 JUnit 測試，失敗的測試會重跑（跟官方 CI 一樣用 Gradle 的 test-retry）。
+# 可以選在 GitHub 的機器（4 核 16G，免費，最多 6 小時）或社群 VM 上跑；社群 VM 比較快。
 # 跟 kafka-loop 的差別：loop 是同一組測試跑很多次量失敗率；full 是全部跑一次，分出「真的失敗」和「重跑才過的 flaky」。
-# 整個 job 吃滿一台機器，靠 Gradle 的 maxParallelForks 平行，所以排在只有一個 runner 的 kafka-full 機器上。
+# 整個 job 吃滿一台機器，靠 Gradle 的 maxParallelForks 平行，所以在社群 VM 上會排在只有一個 runner 的 kafka-full 機器。
 # 觸發：Actions -> kafka-full -> Run workflow（只有對 clip 有 write 權限的人能按）。
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-full
-run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.suite }} retry=${{ inputs.retries }} (${{ inputs.jdk }})"
+run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.suite }} retry=${{ inputs.retries }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
 
 on:
   workflow_dispatch:
@@ -31,14 +32,19 @@ on:
         type: choice
         options: [17-jdk-jammy, 21-jdk-jammy, 25-jdk-jammy]
         default: 17-jdk-jammy
+      runner:
+        description: 在哪裡跑：github（GitHub 的機器，免費，一個 job 最多 6 小時）或 community-vm（社群 VM）
+        type: choice
+        options: [github, community-vm]
+        default: github
 
 permissions:
   contents: read
 
 jobs:
   full:
-    runs-on: [self-hosted, linux, kafka-full]
-    timeout-minutes: 600
+    runs-on: ${{ inputs.runner == 'community-vm' && fromJSON('["self-hosted","linux","kafka-full"]') || 'ubuntu-latest' }}
+    timeout-minutes: ${{ inputs.runner == 'community-vm' && 600 || 350 }}
     env:
       ACCOUNT: ${{ inputs.account }}
       REVISION: ${{ inputs.revision }}
@@ -85,16 +91,19 @@ jobs:
         continue-on-error: true
         run: |
           set -uo pipefail
-          # 每個測試 fork 最多 3G heap（core），再留 8G 給 Gradle daemon、編譯和系統
+          # 每個測試 fork 最多 3G heap（core），再留一些給 Gradle daemon 和系統；
+          # GitHub 的 16G 機器會算出 4，跟官方 CI 的 maxParallelForks=4 一樣
           mem_gb=$(free -g | awk '/^Mem:/{print $2}')
-          forks=$(( (mem_gb - 8) / 3 ))
+          forks=$(( (mem_gb - 3) / 3 ))
           (( forks > $(nproc) )) && forks=$(nproc)
           (( forks < 1 )) && forks=1
           echo "cpu $(nproc), mem ${mem_gb}G -> maxParallelForks=$forks"
           export FORKS=$forks
+          # GitHub 的機器上有 docker 和 podman，社群 VM 只有 podman
+          CR=$(command -v podman || command -v docker)
           mkdir -p "$GRADLE_CACHE_DIR"
-          podman pull -q "$IMAGE"
-          podman run --rm \
+          "$CR" pull -q "$IMAGE"
+          "$CR" run --rm \
             -e TASKS -e RETRIES -e FORKS \
             -v "$PWD/kafka:/tmp/kafka:z" \
             -v "$GRADLE_CACHE_DIR:/root/.gradle:z" \
