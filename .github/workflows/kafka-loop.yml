@@ -107,6 +107,10 @@ jobs:
           set -uo pipefail
           # GitHub 的機器上有 docker 和 podman，社群 VM 只有 podman
           CR=$(command -v podman || command -v docker)
+          # 用一般使用者跑，不要用 root：root 可以無視檔案權限，會讓改權限再看會不會失敗的測試誤判。
+          # 用跟 host 上 runner 一樣的 uid，掛進去的 kafka 目錄和 Gradle cache 才寫得了。
+          # rootless podman 用 --userns=keep-id 做到；docker 直接指定 --user。
+          if [ "$(basename "$CR")" = podman ]; then USEROPT="--userns=keep-id"; else USEROPT="--user $(id -u):$(id -g)"; fi
           mkdir -p "$GRADLE_CACHE_DIR"
           "$CR" pull -q "$IMAGE"
           : > out/failures.txt
@@ -115,10 +119,12 @@ jobs:
             echo "::group::run $i/$LOOPS"
             # podman 預設每個容器最多 2048 個 process/thread，Gradle 加上多個測試 fork 會超過，
             # 出現 pthread_create failed (EAGAIN)，所以把上限拿掉（跟 kafka/test_kafka.sh 一樣）
+            # shellcheck disable=SC2086  # USEROPT may be two words
             "$CR" run --cpus=3 --rm --pids-limit=-1 --ulimit nproc=16384:16384 --ulimit nofile=65536:65536 \
+              $USEROPT -e HOME=/tmp -e GRADLE_USER_HOME=/gradle-home \
               -e COMMAND \
               -v "$PWD/kafka:/tmp/kafka:z" \
-              -v "$GRADLE_CACHE_DIR:/root/.gradle:z" \
+              -v "$GRADLE_CACHE_DIR:/gradle-home:z" \
               "$IMAGE" \
               bash -c 'set -f; read -ra cmd <<< "$COMMAND"; cd /tmp/kafka && chmod +x ./gradlew && "${cmd[@]}"'
             rc=$?
