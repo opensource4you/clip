@@ -423,6 +423,7 @@ tr.grp.hit td{{animation:hit 1.6s ease-out}} @keyframes hit{{0%,40%{{background:
 .info{{background:var(--info-bg);color:var(--info-fg)}} .muted{{background:var(--muted-bg);color:var(--muted)}} .stale{{color:var(--red);font-weight:600}}
 #q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
 .layout{{display:grid;grid-template-columns:minmax(300px,380px) minmax(0,1fr);gap:20px;align-items:start}}
+.layout main{{padding-bottom:calc(100vh - 160px)}}
 .side{{position:sticky;top:12px;max-height:calc(100vh - 24px);display:flex;flex-direction:column}}
 .side .head{{flex:none}} .side .people{{flex:1;min-height:0;overflow-y:auto}}
 .side .summary thead th{{position:sticky;top:0;z-index:1}}
@@ -438,6 +439,7 @@ tr.grp{{scroll-margin-top:var(--thead-h,37px)}}
 nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:var(--head-hover);border-radius:4px}} nav.pages a{{padding:2px 8px}}
 #theme{{float:right;font-size:12px;padding:2px 8px;cursor:pointer;background:var(--input-bg);color:var(--muted);border:1px solid var(--input-bd);border-radius:4px}}
 @media (max-width:1000px){{
+  .layout main{{padding-bottom:0}}
   .layout{{display:block}} .side{{position:static;max-height:none;display:block;margin-bottom:20px}} .side .people{{overflow:visible}}
 }}
 @media (max-width:700px){{
@@ -539,11 +541,21 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     mark(l);
   }}
   window.addEventListener('scroll',spy,{{passive:true}});
+  // A group header that was scrolled past stays stuck at the top, so the browser treats it
+  // as already visible and scrollIntoView does nothing. Work out where the header would sit
+  // from its first PR row, which is never sticky.
+  function jump(g){{
+    var r=g.nextElementSibling;
+    while(r&&(r.style.display==='none')) r=r.nextElementSibling;
+    if(!r||r.classList.contains('grp')){{g.scrollIntoView({{block:'start'}}); return;}}
+    var y=r.getBoundingClientRect().top+window.scrollY-g.offsetHeight-thead.getBoundingClientRect().height;
+    window.scrollTo(0,Math.max(0,y));
+  }}
   sum.addEventListener('click',function(ev){{
     var a=ev.target.closest('a'); if(!a) return;
     var g=document.getElementById(a.getAttribute('href').slice(1)); if(!g) return;
     ev.preventDefault(); history.replaceState(null,'',a.getAttribute('href'));
-    g.scrollIntoView({{block:'start'}});
+    jump(g);
     g.classList.remove('hit'); void g.offsetWidth; g.classList.add('hit');
     mark(g.dataset.login);
   }});
