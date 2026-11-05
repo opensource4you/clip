@@ -38,6 +38,11 @@ jobs:
       TC_PATHS: ${{ inputs.tc_paths }}
       jdk_version: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
     steps:
+      - uses: actions/checkout@v7
+        with:
+          path: clip
+          sparse-checkout: kafka
+
       - name: Validate inputs
         run: |
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
@@ -78,7 +83,8 @@ jobs:
           echo "mem ${total_mb}MB -> containers=$n max-parallel=$parallel"
           export KAFKA_NUM_CONTAINERS=$n
           export _DUCKTAPE_OPTIONS="--max-parallel $parallel"
-          image_name="ducker-ak:$(git rev-parse --short HEAD)" ./tests/docker/run_tests.sh $TC_PATHS
+          # keep a copy of the output so the summary can show it when no report was written
+          image_name="ducker-ak:$(git rev-parse --short HEAD)" ./tests/docker/run_tests.sh $TC_PATHS 2>&1 | tee ../e2e.log
 
       - name: Summary
         if: always()
@@ -89,16 +95,9 @@ jobs:
             echo "- tests: \`${TC_PATHS:-all}\`"
             echo "- jdk: \`${jdk_version}\`"
             echo "- result: **${{ steps.tests.outcome }}**"
-            for r in results/*/report.txt; do
-              [ -f "$r" ] || continue
-              echo; echo '```'
-              # 只放統計和失敗的測試，完整報告在 artifact
-              awk '/^test_id:/ { id = $2; next }
-                   /^status:/ { if ($2 == "FAIL" || $2 == "FLAKY") print $2, id; next }
-                   !seen_tests && /^(SESSION REPORT|ducktape|session_id|run time|tests run|passed|flaky|failed|ignored)/ { print }
-                   /^ignored:/ { seen_tests = 1 }' "$r" | head -n 200
-              echo '```'
-            done
+            echo
+            # 統計和失敗/flaky 的測試；完整報告在 artifact
+            python3 ../clip/kafka/ducktape_summary.py results ../e2e.log
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Archive results
@@ -114,6 +113,7 @@ jobs:
           path: |
             kafka/results/*/report.txt
             kafka/results.zip
+            e2e.log
           if-no-files-found: ignore
           retention-days: 14
 
