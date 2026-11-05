@@ -101,6 +101,8 @@ jobs:
             "https://github.com/${ACCOUNT}/kafka" "+${REVISION}:tmp"
           git switch -q tmp
           git log -1 --format='%H %s'
+          # 分支之後會往前走，summary 要記下這次實際測的是哪個 commit
+          git log -1 --format='%H %s' > ../out/commit.txt
 
       - name: Run ${{ inputs.loops }}x
         run: |
@@ -150,6 +152,7 @@ jobs:
           path: |
             out/failures.txt
             out/stats.txt
+            out/commit.txt
           if-no-files-found: ignore
 
       - name: Upload test results
@@ -184,7 +187,12 @@ jobs:
           import collections, os, pathlib
           runs = failed = 0
           counts = collections.Counter()
+          commits = {}
           for d in sorted(pathlib.Path("loops").glob("loop-c*")):
+              c = d / "commit.txt"
+              if c.exists():
+                  sha, _, subject = c.read_text().strip().partition(" ")
+                  commits[sha] = subject
               s = d / "stats.txt"
               if s.exists():
                   n, f = map(int, s.read_text().split())
@@ -196,6 +204,10 @@ jobs:
                       counts[(task, test)] += 1
           e = os.environ
           print(f"## kafka-loop: `{e['ACCOUNT']}/{e['REVISION']}`\n")
+          print(f"- repo: [{e['ACCOUNT']}/kafka](https://github.com/{e['ACCOUNT']}/kafka)、revision: `{e['REVISION']}`")
+          # normally one commit; more than one means the branch moved while the containers started
+          for sha, subject in commits.items():
+              print(f"- commit: [`{sha[:12]}`](https://github.com/{e['ACCOUNT']}/kafka/commit/{sha}) {subject}")
           print(f"- command: `{e['COMMAND']}`\n- jdk: `{e['JDK']}`")
           print(f"- **{failed} / {runs}** runs failed\n")
           if counts:

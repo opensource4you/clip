@@ -64,6 +64,9 @@ jobs:
             "https://github.com/${ACCOUNT}/kafka" "+${REVISION}:tmp"
           git switch -q tmp
           git log -1 --format='%H %s'
+          # 分支之後會往前走，summary 要記下這次實際測的是哪個 commit
+          echo "COMMIT=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "COMMIT_SUBJECT=$(git log -1 --format=%s)" >> "$GITHUB_ENV"
 
       - name: Build
         working-directory: kafka
@@ -92,6 +95,8 @@ jobs:
         run: |
           {
             echo "## kafka-e2e: \`${ACCOUNT}/${REVISION}\`"
+            echo "- repo: [${ACCOUNT}/kafka](https://github.com/${ACCOUNT}/kafka)、revision: \`${REVISION}\`"
+            echo "- commit: [\`${COMMIT:0:12}\`](https://github.com/${ACCOUNT}/kafka/commit/${COMMIT}) ${COMMIT_SUBJECT}"
             echo "- tests: \`${TC_PATHS:-all}\`"
             echo "- jdk: \`${jdk_version}\`"
             echo "- result: **${{ steps.tests.outcome }}**"
