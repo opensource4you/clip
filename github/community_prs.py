@@ -420,8 +420,10 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 .info{{background:var(--info-bg);color:var(--info-fg)}} .muted{{background:var(--muted-bg);color:var(--muted)}} .stale{{color:var(--red);font-weight:600}}
 #q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
 .layout{{display:grid;grid-template-columns:minmax(300px,380px) minmax(0,1fr);gap:20px;align-items:start}}
-.side{{position:sticky;top:12px;max-height:calc(100vh - 24px);overflow-y:auto}}
+.side{{position:sticky;top:12px;max-height:calc(100vh - 24px);display:flex;flex-direction:column}}
+.side .head{{flex:none}} .side .people{{flex:1;min-height:0;overflow-y:auto}}
 .side .summary thead th{{position:sticky;top:0;z-index:1}}
+.side #repo,.side #q{{display:block;width:100%;box-sizing:border-box;margin:0 0 8px}} .side #count{{margin:0 0 10px;font-size:12px}}
 tr.grp{{scroll-margin-top:40px}}
 .summary{{width:100%}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
@@ -433,7 +435,7 @@ tr.grp{{scroll-margin-top:40px}}
 nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:var(--head-hover);border-radius:4px}} nav.pages a{{padding:2px 8px}}
 #theme{{float:right;font-size:12px;padding:2px 8px;cursor:pointer;background:var(--input-bg);color:var(--muted);border:1px solid var(--input-bd);border-radius:4px}}
 @media (max-width:1000px){{
-  .layout{{display:block}} .side{{position:static;max-height:none;overflow:visible;margin-bottom:20px}}
+  .layout{{display:block}} .side{{position:static;max-height:none;display:block;margin-bottom:20px}} .side .people{{overflow:visible}}
 }}
 @media (max-width:700px){{
   body{{margin:12px auto;padding:0 10px;font-size:13px}}
@@ -451,14 +453,18 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
   tr.grp td{{font-size:14px}}
 }}
 </style></head><body>
+<div class="layout">
+<aside class="side">
+<div class="head">
 <button id="theme" title="theme: auto / light / dark">◐ auto</button>
 <h1>{e(title)}</h1>
 {navhtml}<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · generated {now}{refresh}</div>
 <select id="repo"><option value="">all repos</option>{options}</select>
-<input id="q" placeholder="filter: login / title / status (e.g. no review)">
-<span id="count"></span>
-<div class="layout">
-<aside class="side"><table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table></aside>
+<input id="q" placeholder="filter: login / title / status">
+<div id="count"></div>
+</div>
+<div class="people"><table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table></div>
+</aside>
 <main>{main_table}</main>
 </div>
 <script>
