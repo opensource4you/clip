@@ -5,7 +5,7 @@
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-full
-run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.tasks }} retry=${{ inputs.retries }} (${{ inputs.jdk }})"
+run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.suite }} retry=${{ inputs.retries }} (${{ inputs.jdk }})"
 
 on:
   workflow_dispatch:
@@ -16,9 +16,11 @@ on:
       revision:
         description: 分支、tag 或 commit SHA
         default: trunk
-      tasks:
-        description: 要跑的 Gradle task（例如 test，或 core:test streams:test）
-        default: test
+      suite:
+        description: 要跑哪一塊（all 是整個 test；其他選項在舊分支可能有模組不存在）
+        type: choice
+        options: [all, core, clients, streams, connect, server, tools]
+        default: all
       retries:
         description: 失敗的測試最多重跑幾次（官方 CI 用 1）
         type: choice
@@ -40,7 +42,7 @@ jobs:
     env:
       ACCOUNT: ${{ inputs.account }}
       REVISION: ${{ inputs.revision }}
-      TASKS: ${{ inputs.tasks }}
+      SUITE: ${{ inputs.suite }}
       RETRIES: ${{ inputs.retries }}
       IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
       GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/full-${{ inputs.jdk }}
@@ -54,7 +56,18 @@ jobs:
         run: |
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
-          bash clip/kafka/check_gradle_command.sh "./gradlew $TASKS"
+          case "$SUITE" in
+            all)     tasks="test" ;;
+            core)    tasks="core:test" ;;
+            clients) tasks="clients:test clients:clients-integration-tests:test" ;;
+            streams) tasks="streams:test streams:integration-tests:test streams:streams-scala:test streams:test-utils:test" ;;
+            connect) tasks="connect:runtime:test connect:mirror:test connect:mirror-client:test connect:transforms:test connect:json:test connect:file:test connect:basic-auth-extension:test" ;;
+            server)  tasks="metadata:test raft:test storage:test server:test server-common:test group-coordinator:test share-coordinator:test transaction-coordinator:test coordinator-common:test" ;;
+            tools)   tasks="tools:test shell:test trogdor:test" ;;
+            *) echo "::error::未知的 suite：$SUITE"; exit 1 ;;
+          esac
+          bash clip/kafka/check_gradle_command.sh "./gradlew $tasks"
+          echo "TASKS=$tasks" >> "$GITHUB_ENV"
           echo "runner: $RUNNER_NAME"
 
       - name: Fetch kafka
@@ -97,7 +110,7 @@ jobs:
         run: |
           {
             echo "## kafka-full: \`${ACCOUNT}/${REVISION}\`"
-            echo "- tasks: \`${TASKS}\`、retries: ${RETRIES}、jdk: \`${IMAGE##*:}\`"
+            echo "- suite: ${SUITE}（\`${TASKS}\`）、retries: ${RETRIES}、jdk: \`${IMAGE##*:}\`"
             echo "- result: **${{ steps.tests.outcome }}**"
             python3 clip/kafka/junit_failures.py kafka --summary
           } >> "$GITHUB_STEP_SUMMARY"
