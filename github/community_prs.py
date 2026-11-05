@@ -39,7 +39,7 @@ PER_AUTHOR = 50     # PRs per page per author; more pages are fetched when neede
 WORKERS = 8         # concurrent requests
 RETRIES = 4
 TIMELINE = 30       # recent commits/reviews/comments per open PR, used to work out who the PR is waiting on
-WAIT_DAYS = 14      # waiting on a reviewer this long counts as stale
+WAIT_DAYS = 14      # no progress for this long counts as idle
 
 
 def load_config(path, cli_people, cli_repos):
@@ -267,41 +267,6 @@ def ball(pr):
     return whose, since
 
 
-def last_reviewed(pr):
-    """How long an open PR has gone without a reviewer: (kind, since_iso).
-
-      ("review", t)  someone other than the author last reviewed or commented at t
-      ("never", t)   nobody has, so it has gone without one since it was opened at t
-      ("older", t)   the last one is older than the fetched timeline, whose oldest event is t
-    Bots are ignored. Returns None when the PR has no timeline (merged/closed pages).
-    """
-    tl = pr.get("timelineItems")
-    if not tl:
-        return None
-    me = ((pr.get("author") or {}).get("login") or "").lower()
-    last = None
-    for n in tl["nodes"]:
-        if not n or n.get("__typename") == "PullRequestCommit":
-            continue
-        a = n.get("author") or {}
-        login = (a.get("login") or "").lower()
-        if not login or login == me or a.get("__typename") == "Bot" or login.endswith("[bot]"):
-            continue
-        when = n.get("submittedAt") or n.get("createdAt")
-        if when and (last is None or when > last):
-            last = when
-    if last is not None:
-        return "review", last
-    if tl.get("filteredCount", 0) > len(tl["nodes"]) and \
-            (pr["reviews"]["totalCount"] or pr["comments"]["totalCount"]):
-        times = [n.get("submittedAt") or n.get("createdAt") or (n.get("commit") or {}).get("committedDate")
-                 for n in tl["nodes"] if n]
-        times = [t for t in times if t]
-        if times:
-            return "older", min(times)
-    return "never", pr["createdAt"]
-
-
 def dispatch_target(cli):
     """(owner/repo, workflow file) for the page's refresh link.
     --dispatch owner/repo:file.yml, or auto-detected inside GitHub Actions."""
@@ -346,7 +311,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
         b = dt.datetime.fromisoformat(end.replace("Z", "+00:00"))
         return max(0, (b - a).days)
 
-    sumcols = (f'<th data-k="nr">no review</th><th data-k="st" title="waiting on a reviewer (or a merge) for {WAIT_DAYS}+ days">waiting ≥{WAIT_DAYS}d</th>' if openmode else
+    sumcols = (f'<th data-k="nr">no review</th><th data-k="st" title="no progress for {WAIT_DAYS}+ days">idle ≥{WAIT_DAYS}d</th>' if openmode else
                '<th data-k="rp" title="distinct repos">repos</th><th data-k="ad" title="average days from open to merge">avg days</th>')
     # dropdown lists every configured repo; ones without PRs in this page are marked
     counts = {}
@@ -355,28 +320,24 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
             counts[p["repository"]["nameWithOwner"]] = counts.get(p["repository"]["nameWithOwner"], 0) + 1
     all_repos = sorted(set(repos) | set(counts), key=str.lower)
     options = "".join(f'<option value="{e(r)}">{e(r)}{"" if counts.get(r) else " (0)"}</option>' for r in all_repos)
-    ballsel = ('<select id="ball"><option value="">anyone</option>'
-               '<option value="reviewer">waiting on reviewer</option>'
-               '<option value="author">waiting on author</option></select>') if openmode else ""
 
-    ncols = 8 if openmode else 7
     body = []
     for login, prs in sorted(result.items(), key=lambda kv: (-len(kv[1]), kv[0].lower())):
         if not prs:
             continue
         balls = {p["url"]: ball(p) for p in prs}
         if openmode:
-            # PRs waiting on reviewers first, longest wait first; the rest by last update
+            # the PR that has gone longest without progress first; drafts last
             def order(p):
                 b = balls[p["url"]]
-                if b and b[0] != "author":
+                if b:
                     return (0, b[1], p["updatedAt"])
                 return (1, "", p["updatedAt"])
             prs = sorted(prs, key=order)
         else:
             prs = sorted(prs, key=lambda p: p["updatedAt"], reverse=True)
         body.append(
-            f'<tr class="grp" id="u-{e(login)}" data-login="{e(login)}"><td colspan="{ncols}">'
+            f'<tr class="grp" id="u-{e(login)}" data-login="{e(login)}"><td colspan="7">'
             f'<a href="https://github.com/{e(login)}" target="_blank">{e(login)}</a> <small></small> <span class="gstat"></span></td></tr>')
         for p in prs:
             lab, cls = review_label(p)
@@ -384,21 +345,16 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
             b = balls[p["url"]]
             whose, wait = (b[0], days_ago(b[1])) if b else ("", 0)
             if b:
-                stale = whose != "author" and wait >= WAIT_DAYS
+                stale = wait >= WAIT_DAYS
             else:   # drafts, or results cached before the timeline was fetched
                 stale = p["state"] == "OPEN" and not p["isDraft"] and days_ago(p[stale_key]) >= WAIT_DAYS
             labels = " ".join(f'<span class="lbl">{e(l["name"])}</span>' for l in p["labels"]["nodes"])
             flags, ftext = [], []
             sc = " stale" if stale else ""
-            if whose == "reviewer":
-                flags.append(f'<span class="fl wait-r{sc}" title="author acted last; no reviewer response for {wait} days">⏳ reviewer {wait}d</span>')
-                ftext.append("waiting reviewer")
-            elif whose == "merge":
-                flags.append(f'<span class="fl wait-r{sc}" title="approved {wait} days ago; waiting for a merge">⏳ merge {wait}d</span>')
-                ftext.append("waiting merge")
-            elif whose == "author":
-                flags.append(f'<span class="fl wait-a" title="a reviewer responded {wait} days ago; ball is with the author">↩ author {wait}d</span>')
-                ftext.append("waiting author")
+            if whose:
+                flags.append(f'<span class="fl wait-r{sc}" title="no progress for {wait} days">⏳ {wait}d</span>')
+                if stale:
+                    ftext.append("idle")
             if p["state"] == "OPEN":
                 ci = ci_state(p)
                 if ci == "FAILURE":
@@ -411,35 +367,14 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                     flags.append('<span class="fl conflict" title="has merge conflicts, needs rebase">⚠ conflict</span>'); ftext.append("conflict")
             conflict = int(p.get("mergeable") == "CONFLICTING" and p["state"] == "OPEN")
             days = took(p)
-            # numbers the page sorts on (within each person's group)
-            sk = {"wait": wait if whose in ("reviewer", "merge") else (-1 if whose else -2),
-                  "cm": p["comments"]["totalCount"]}
             if openmode:
-                sk["op"], sk["up"] = days_ago(p["createdAt"]), days_ago(p["updatedAt"])
-                # days without a reviewer; drafts are not waiting on anyone, so blank and last
-                lr = None if p["isDraft"] else last_reviewed(p)
-                if lr is None:
-                    sk["lr"], lrcell = -1, '<td class="n"></td>'
-                else:
-                    kind, when = lr
-                    sk["lr"] = days_ago(when)
-                    if kind == "review":
-                        lrcell = f'<td class="n" title="last reviewed or commented by someone else {sk["lr"]} days ago">{sk["lr"]}d</td>'
-                    elif kind == "never":
-                        lrcell = (f'<td class="n" title="nobody but the author has reviewed or commented; open for {sk["lr"]} days">'
-                                  f'{sk["lr"]}d<br><small class="never">never</small></td>')
-                    else:
-                        lrcell = (f'<td class="n" title="no review or comment in the last {TIMELINE} timeline events, '
-                                  f'so at least {sk["lr"]} days">&gt;{sk["lr"]}d</td>')
-                tail = (f'<td class="n">{sk["op"]}d</td>'
-                        f'<td class="n">{sk["up"]}d</td>' + lrcell)
+                tail = (f'<td class="n">{days_ago(p["createdAt"])}d</td>'
+                        f'<td class="n">{days_ago(p["updatedAt"])}d</td>')
             else:
                 end = p.get("mergedAt") or p["updatedAt"]
-                sk["op"], sk["up"] = days, days_ago(end)
                 tail = f'<td class="n">{days}d</td><td class="n">{days_ago(end)}d</td>'
-            skattr = " ".join(f'data-{k}="{v}"' for k, v in sk.items())
             body.append(
-                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" data-ball="{"reviewer" if whose == "merge" else whose}" {skattr} '
+                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" '
                 f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {" ".join(ftext)}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
@@ -448,13 +383,10 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                 f'<td class="n">{p["comments"]["totalCount"]}</td>'
                 + tail + '</tr>')
     main_table = ('<table class="prs"><colgroup><col class="c-repo"><col class="c-num"><col class="c-title">'
-                  '<col class="c-st">' + '<col class="c-n">' * (ncols - 4) + '</colgroup>'
-                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th>'
-                  + ('<th data-s="wait" title="sort by how long it has waited on a reviewer or a merge">status</th>' if openmode else '<th>status</th>')
-                  + '<th class="n" data-s="cm" title="comments">💬</th>'
-                  + ('<th class="n" data-s="op">opened</th><th class="n" data-s="up">updated</th>'
-                     '<th class="n" data-s="lr" title="days without a reviewer: since someone other than the author last reviewed or commented, or since it was opened if nobody has">reviewed</th>' if openmode else
-                     '<th class="n" data-s="op" title="days from open to merge">took</th><th class="n" data-s="up" title="merged how long ago">merged</th>')
+                  '<col class="c-st"><col class="c-n"><col class="c-n"><col class="c-n"></colgroup>'
+                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
+                  + ('<th class="n">opened</th><th class="n">updated</th>' if openmode else
+                     '<th class="n" title="days from open to merge">took</th><th class="n" title="merged how long ago">merged</th>')
                   + '</tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
 
@@ -486,11 +418,9 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 .st{{white-space:nowrap;font-size:12px;border-radius:4px;padding:1px 6px}}
 .ok{{background:var(--ok-bg);color:var(--ok-fg)}} .warn{{background:var(--warn-bg);color:var(--warn-fg)}} .bad{{background:var(--bad-bg);color:var(--bad-fg)}}
 .info{{background:var(--info-bg);color:var(--info-fg)}} .muted{{background:var(--muted-bg);color:var(--muted)}} .stale{{color:var(--red);font-weight:600}}
-#q,#repo,#ball{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
+#q,#repo{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
 .summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
-.never{{color:var(--bad-fg)}}
-.prs th[data-s]{{cursor:pointer;user-select:none}} .prs th[data-s]:hover{{background:var(--head-hover)}} .prs th.on::after{{content:" ↓";color:var(--muted)}} .prs th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
 .mrepo{{display:none}}
 .fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:var(--red);font-weight:600}} .ci-wait{{color:var(--warn-fg)}} .ci-ok{{color:var(--ok-fg)}}
@@ -501,11 +431,11 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 @media (max-width:700px){{
   body{{margin:12px auto;padding:0 10px;font-size:13px}}
   h1{{font-size:17px}} .meta{{font-size:12px}}
-  #repo,#ball,#q{{width:100%;box-sizing:border-box;margin:0 0 8px}} #count{{display:block;margin-bottom:8px;font-size:12px}}
+  #repo,#q{{width:100%;box-sizing:border-box;margin:0 0 8px}} #count{{display:block;margin-bottom:8px;font-size:12px}}
   .summary{{width:100%;min-width:0}}
   th,td{{padding:5px 6px}}
-  .c-repo,.c-n:nth-child(5),.c-n:nth-child(6),.c-n:nth-child(8){{width:0}}
-  td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6),.prs td:nth-child(8),.prs th:nth-child(8){{padding:0;font-size:0;overflow:hidden}}
+  .c-repo,.c-n:nth-child(5),.c-n:nth-child(6){{width:0}}
+  td.repo,th.repo,.prs td:nth-child(5),.prs th:nth-child(5),.prs td:nth-child(6),.prs th:nth-child(6){{padding:0;font-size:0;overflow:hidden}}
   .c-num{{width:56px}} .c-st{{width:88px}} .c-n:nth-child(7){{width:64px}} .prs th{{font-size:12px}}
   .st{{white-space:normal;font-size:11px}}
   .mrepo{{color:var(--faint);font-size:11px}}
@@ -517,7 +447,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 <button id="theme" title="theme: auto / light / dark">◐ auto</button>
 <h1>{e(title)}</h1>
 {navhtml}<div class="meta"><span title="{e(", ".join(repos))}">{len(repos)} repos</span> · generated {now}{refresh}</div>
-<select id="repo"><option value="">all repos</option>{options}</select>{ballsel}
+<select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status (e.g. no review)">
 <span id="count"></span>
 <table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table>
@@ -525,7 +455,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 <script>
 (function(){{
   var OPEN={"true" if openmode else "false"};
-  var q=document.getElementById('q'), sel=document.getElementById('repo'), bsel=document.getElementById('ball'), sum=document.getElementById('sum'), cnt=document.getElementById('count');
+  var q=document.getElementById('q'), sel=document.getElementById('repo'), sum=document.getElementById('sum'), cnt=document.getElementById('count');
   var rows=Array.prototype.slice.call(document.querySelectorAll('tr.pr'));
   var ths=Array.prototype.slice.call(document.querySelectorAll('.summary th')), sortKey='n', sortAsc=false;
   ths.forEach(function(t){{t.addEventListener('click',function(){{
@@ -533,9 +463,9 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     apply();
   }});}});
   function apply(){{
-    var v=q.value.toLowerCase(), repo=sel.value, bl=bsel?bsel.value:'', per={{}}, shown=0;
+    var v=q.value.toLowerCase(), repo=sel.value, per={{}}, shown=0;
     rows.forEach(function(r){{
-      var ok=(!repo||r.dataset.repo===repo)&&(!bl||r.dataset.ball===bl)&&r.dataset.text.toLowerCase().includes(v);
+      var ok=(!repo||r.dataset.repo===repo)&&r.dataset.text.toLowerCase().includes(v);
       r.style.display=ok?'':'none';
       if(!ok) return;
       shown++;
@@ -548,7 +478,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
       var p=per[g.dataset.login]||{{n:0,nr:0,st:0,cf:0,days:0}};
       g.style.display=p.n?'':'none'; g.querySelector('small').textContent=p.n;
       g.querySelector('.gstat').innerHTML=OPEN
-        ?(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' waiting ≥{WAIT_DAYS}d</b>':'')+(p.cf?'<b class="cf">'+p.cf+' conflict</b>':'')
+        ?(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' idle ≥{WAIT_DAYS}d</b>':'')+(p.cf?'<b class="cf">'+p.cf+' conflict</b>':'')
         :(p.n?'<b>avg '+Math.round(p.days/p.n)+'d to merge</b>':'');
     }});
     Object.keys(per).forEach(function(l){{var p=per[l]; p.rp=Object.keys(p.repos).length; p.ad=p.n?Math.round(p.days/p.n):0;}});
@@ -564,32 +494,8 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     cnt.textContent=shown+' PRs from '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
   }}
-  // PR table: clicking a header sorts the rows inside each person's group
-  var ptb=document.querySelector('.prs tbody'), pths=Array.prototype.slice.call(document.querySelectorAll('.prs th[data-s]'));
-  var pKey=OPEN?'wait':'', pAsc=false;
-  Array.prototype.slice.call(ptb.querySelectorAll('tr.pr')).forEach(function(r,i){{r.dataset.i=i;}});
-  function psort(){{
-    var groups=[], g=null;
-    Array.prototype.slice.call(ptb.children).forEach(function(r){{
-      if(r.classList.contains('grp')){{g={{h:r,rows:[]}};groups.push(g);}} else if(g) g.rows.push(r);
-    }});
-    groups.forEach(function(g){{
-      // negative keys (drafts, PRs waiting on the author) stay last in either direction
-      if(pKey) g.rows.sort(function(a,b){{var x=+a.dataset[pKey], y=+b.dataset[pKey];
-        if((x<0)!==(y<0)) return x<0?1:-1;
-        var d=x-y; if(!pAsc)d=-d; return d||(+a.dataset.i)-(+b.dataset.i);}});
-      ptb.appendChild(g.h); g.rows.forEach(function(r){{ptb.appendChild(r);}});
-    }});
-    pths.forEach(function(t){{t.classList.toggle('on',t.dataset.s===pKey);t.classList.toggle('asc',pAsc);}});
-  }}
-  pths.forEach(function(t){{t.addEventListener('click',function(){{
-    if(pKey===t.dataset.s) pAsc=!pAsc; else {{pKey=t.dataset.s; pAsc=false;}}
-    psort();
-  }});}});
-  psort();
-
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
-  q.addEventListener('input',apply); sel.addEventListener('change',apply); if(bsel)bsel.addEventListener('change',apply); apply();
+  q.addEventListener('input',apply); sel.addEventListener('change',apply); apply();
 
   var tb=document.getElementById('theme'), modes=['auto','light','dark'], icons={{auto:'◐',light:'☀',dark:'☾'}};
   function cur(){{return document.documentElement.getAttribute('data-theme')||'auto';}}
