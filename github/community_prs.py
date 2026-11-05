@@ -268,8 +268,13 @@ def ball(pr):
 
 
 def last_reviewed(pr):
-    """When someone other than the author last reviewed or commented (ISO), "?" if that is
-    older than the fetched timeline, or None if nobody has. Bots are ignored."""
+    """How long an open PR has gone without a reviewer: (kind, since_iso).
+
+      ("review", t)  someone other than the author last reviewed or commented at t
+      ("never", t)   nobody has, so it has gone without one since it was opened at t
+      ("older", t)   the last one is older than the fetched timeline, whose oldest event is t
+    Bots are ignored. Returns None when the PR has no timeline (merged/closed pages).
+    """
     tl = pr.get("timelineItems")
     if not tl:
         return None
@@ -285,10 +290,16 @@ def last_reviewed(pr):
         when = n.get("submittedAt") or n.get("createdAt")
         if when and (last is None or when > last):
             last = when
-    if last is None and tl.get("filteredCount", 0) > len(tl["nodes"]) and \
+    if last is not None:
+        return "review", last
+    if tl.get("filteredCount", 0) > len(tl["nodes"]) and \
             (pr["reviews"]["totalCount"] or pr["comments"]["totalCount"]):
-        return "?"
-    return last
+        times = [n.get("submittedAt") or n.get("createdAt") or (n.get("commit") or {}).get("committedDate")
+                 for n in tl["nodes"] if n]
+        times = [t for t in times if t]
+        if times:
+            return "older", min(times)
+    return "never", pr["createdAt"]
 
 
 def dispatch_target(cli):
@@ -405,15 +416,21 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                   "cm": p["comments"]["totalCount"]}
             if openmode:
                 sk["op"], sk["up"] = days_ago(p["createdAt"]), days_ago(p["updatedAt"])
-                lr = last_reviewed(p)
+                # days without a reviewer; drafts are not waiting on anyone, so blank and last
+                lr = None if p["isDraft"] else last_reviewed(p)
                 if lr is None:
-                    sk["lr"], lrcell = 99999, '<td class="n" title="nobody but the author has reviewed or commented">—</td>'
-                elif lr == "?":
-                    sk["lr"], lrcell = 99998, f'<td class="n" title="no review or comment in the last {TIMELINE} timeline events">old</td>'
+                    sk["lr"], lrcell = -1, '<td class="n"></td>'
                 else:
-                    sk["lr"], lrcell = days_ago(lr), f'<td class="n">{days_ago(lr)}d</td>'
-                if p["isDraft"]:
-                    sk["lr"] = -1   # drafts are not waiting on anyone, keep them last
+                    kind, when = lr
+                    sk["lr"] = days_ago(when)
+                    if kind == "review":
+                        lrcell = f'<td class="n" title="last reviewed or commented by someone else {sk["lr"]} days ago">{sk["lr"]}d</td>'
+                    elif kind == "never":
+                        lrcell = (f'<td class="n" title="nobody but the author has reviewed or commented; open for {sk["lr"]} days">'
+                                  f'{sk["lr"]}d<br><small class="never">never</small></td>')
+                    else:
+                        lrcell = (f'<td class="n" title="no review or comment in the last {TIMELINE} timeline events, '
+                                  f'so at least {sk["lr"]} days">&gt;{sk["lr"]}d</td>')
                 tail = (f'<td class="n">{sk["op"]}d</td>'
                         f'<td class="n">{sk["up"]}d</td>' + lrcell)
             else:
@@ -436,7 +453,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                   + ('<th data-s="wait" title="sort by how long it has waited on a reviewer or a merge">status</th>' if openmode else '<th>status</th>')
                   + '<th class="n" data-s="cm" title="comments">💬</th>'
                   + ('<th class="n" data-s="op">opened</th><th class="n" data-s="up">updated</th>'
-                     '<th class="n" data-s="lr" title="days since someone other than the author last reviewed or commented">reviewed</th>' if openmode else
+                     '<th class="n" data-s="lr" title="days without a reviewer: since someone other than the author last reviewed or commented, or since it was opened if nobody has">reviewed</th>' if openmode else
                      '<th class="n" data-s="op" title="days from open to merge">took</th><th class="n" data-s="up" title="merged how long ago">merged</th>')
                   + '</tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
@@ -472,6 +489,7 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 #q,#repo,#ball{{padding:6px 8px;font-size:14px;margin:0 8px 12px 0;background:var(--input-bg);color:var(--fg);border:1px solid var(--input-bd);border-radius:4px}} #q{{width:320px}}
 .summary{{width:auto;min-width:420px}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
+.never{{color:var(--bad-fg)}}
 .prs th[data-s]{{cursor:pointer;user-select:none}} .prs th[data-s]:hover{{background:var(--head-hover)}} .prs th.on::after{{content:" ↓";color:var(--muted)}} .prs th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
 .mrepo{{display:none}}
@@ -556,7 +574,10 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
       if(r.classList.contains('grp')){{g={{h:r,rows:[]}};groups.push(g);}} else if(g) g.rows.push(r);
     }});
     groups.forEach(function(g){{
-      if(pKey) g.rows.sort(function(a,b){{var d=(+a.dataset[pKey])-(+b.dataset[pKey]); if(!pAsc)d=-d; return d||(+a.dataset.i)-(+b.dataset.i);}});
+      // negative keys (drafts, PRs waiting on the author) stay last in either direction
+      if(pKey) g.rows.sort(function(a,b){{var x=+a.dataset[pKey], y=+b.dataset[pKey];
+        if((x<0)!==(y<0)) return x<0?1:-1;
+        var d=x-y; if(!pAsc)d=-d; return d||(+a.dataset.i)-(+b.dataset.i);}});
       ptb.appendChild(g.h); g.rows.forEach(function(r){{ptb.appendChild(r);}});
     }});
     pths.forEach(function(t){{t.classList.toggle('on',t.dataset.s===pKey);t.classList.toggle('asc',pAsc);}});
