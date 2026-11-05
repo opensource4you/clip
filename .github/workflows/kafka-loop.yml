@@ -1,0 +1,188 @@
+# 取代 kafka/kafka_loop.pipeline：在社群 VM（self-hosted runner）上反覆跑 Kafka 測試，抓 flaky。
+# 觸發：Actions -> kafka-loop -> Run workflow（只有對 clip 有 write 權限的人能按）。
+# 結果：run 頁面公開可看；最下面的 report job 會彙整每個失敗測試的次數和重跑指令。
+# Runner 設定見 .github/self-hosted-runner.md
+
+name: kafka-loop
+run-name: "loop ${{ inputs.account }}/${{ inputs.revision }} x${{ inputs.loops }} (${{ inputs.jdk }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: GitHub 帳號或組織（例如 apache 或你的帳號）
+        default: apache
+      revision:
+        description: 分支、tag 或 commit SHA
+        default: trunk
+      command:
+        description: 在容器內 kafka 目錄執行的指令
+        default: ./gradlew clean metadata:test
+      jdk:
+        description: eclipse-temurin 映像檔 tag
+        type: choice
+        options: [17-jdk-jammy, 21-jdk-jammy, 25-jdk-jammy]
+        default: 17-jdk-jammy
+      loops:
+        description: 每個容器跑幾次
+        default: "20"
+      parallel:
+        description: 同時開幾個容器（每個佔一個 runner）
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      ids: ${{ steps.ids.outputs.ids }}
+    env:
+      ACCOUNT: ${{ inputs.account }}
+      REVISION: ${{ inputs.revision }}
+      LOOPS: ${{ inputs.loops }}
+      PARALLEL: ${{ inputs.parallel }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
+          [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
+          [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
+          [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 10 ]] || { echo "::error::parallel 要在 1..10"; exit 1; }
+      - id: ids
+        run: echo "ids=$(seq -s, 1 "$PARALLEL" | sed 's/.*/[&]/')" >> "$GITHUB_OUTPUT"
+
+  loop:
+    needs: setup
+    runs-on: [self-hosted, linux, kafka]
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        id: ${{ fromJSON(needs.setup.outputs.ids) }}
+    name: loop c${{ matrix.id }}
+    env:
+      ACCOUNT: ${{ inputs.account }}
+      REVISION: ${{ inputs.revision }}
+      COMMAND: ${{ inputs.command }}
+      LOOPS: ${{ inputs.loops }}
+      IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
+      GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/c${{ matrix.id }}-${{ inputs.jdk }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: clip
+          sparse-checkout: kafka
+
+      - name: Fetch kafka
+        run: |
+          echo "runner: $RUNNER_NAME"
+          rm -rf kafka out && mkdir -p kafka out
+          cd kafka
+          git init -q
+          git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 \
+            "https://github.com/${ACCOUNT}/kafka" "+${REVISION}:tmp"
+          git switch -q tmp
+          git log -1 --format='%H %s'
+
+      - name: Run ${{ inputs.loops }}x
+        run: |
+          set -uo pipefail
+          mkdir -p "$GRADLE_CACHE_DIR"
+          podman pull -q "$IMAGE"
+          : > out/failures.txt
+          failed=0
+          for i in $(seq 1 "$LOOPS"); do
+            echo "::group::run $i/$LOOPS"
+            podman run --cpus=3 --rm \
+              -e COMMAND \
+              -v "$PWD/kafka:/tmp/kafka:z" \
+              -v "$GRADLE_CACHE_DIR:/root/.gradle:z" \
+              "$IMAGE" \
+              bash -c 'cd /tmp/kafka && chmod +x ./gradlew && eval "$COMMAND"'
+            rc=$?
+            echo "::endgroup::"
+            python3 clip/kafka/junit_failures.py kafka | sed "s/^/$i /" >> out/failures.txt
+            if [ "$rc" -ne 0 ]; then
+              failed=$((failed + 1))
+              echo "::warning::c${{ matrix.id }} run $i failed (exit $rc)"
+              # 留下這一輪的 test-results，下一輪 clean 會清掉
+              (cd kafka && find . -path '*/build/test-results/*' -name 'TEST-*.xml' -print0 \
+                | tar -czf "../out/run-$i-test-results.tgz" --null -T -) || true
+            fi
+          done
+          echo "$LOOPS $failed" > out/stats.txt
+          echo "c${{ matrix.id }}: $failed / $LOOPS runs failed"
+          [ "$failed" -eq 0 ]
+
+      - name: Upload summary data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: loop-c${{ matrix.id }}
+          path: |
+            out/failures.txt
+            out/stats.txt
+          if-no-files-found: ignore
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-c${{ matrix.id }}
+          path: |
+            out/run-*.tgz
+            kafka/**/build/reports/tests/**
+          if-no-files-found: ignore
+          retention-days: 14
+
+  report:
+    needs: loop
+    if: always() && needs.loop.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: loop-c*
+          path: loops
+      - name: Summarize
+        env:
+          ACCOUNT: ${{ inputs.account }}
+          REVISION: ${{ inputs.revision }}
+          COMMAND: ${{ inputs.command }}
+          JDK: ${{ inputs.jdk }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import collections, os, pathlib
+          runs = failed = 0
+          counts = collections.Counter()
+          for d in sorted(pathlib.Path("loops").glob("loop-c*")):
+              s = d / "stats.txt"
+              if s.exists():
+                  n, f = map(int, s.read_text().split())
+                  runs += n; failed += f
+              fl = d / "failures.txt"
+              if fl.exists():
+                  for line in fl.read_text().splitlines():
+                      _, task, test = line.split(" ", 2)
+                      counts[(task, test)] += 1
+          e = os.environ
+          print(f"## kafka-loop: `{e['ACCOUNT']}/{e['REVISION']}`\n")
+          print(f"- command: `{e['COMMAND']}`\n- jdk: `{e['JDK']}`")
+          print(f"- **{failed} / {runs}** runs failed\n")
+          if counts:
+              print("| failures | task | test |\n|---:|---|---|")
+              for (task, test), c in counts.most_common():
+                  print(f"| {c} | `{task}` | `{test}` |")
+              by_task = collections.defaultdict(list)
+              for task, test in counts:
+                  by_task[task].append(test)
+              cmd = " ".join(f"{t} " + " ".join(f"--tests {x}" for x in sorted(v))
+                             for t, v in sorted(by_task.items()))
+              print(f"\n重跑失敗的測試：\n```\n./gradlew cleanTest {cmd}\n```")
+          elif runs:
+              print("沒有失敗的測試 :tada:")
+          EOF

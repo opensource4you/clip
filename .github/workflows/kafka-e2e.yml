@@ -1,0 +1,129 @@
+# 取代 kafka/kafka_e2e.pipeline：在社群 VM（self-hosted runner）上跑 Kafka ducktape 系統測試。
+# 觸發：Actions -> kafka-e2e -> Run workflow（只有對 clip 有 write 權限的人能按）。
+# 一個 runner 同時只跑一個 job，等同原本的 throttle(kafka_one_per_node)。
+# Runner 設定見 .github/self-hosted-runner.md
+
+name: kafka-e2e
+run-name: "e2e ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.tc_paths }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      account:
+        description: GitHub 帳號或組織（例如 apache 或你的帳號）
+        default: apache
+      revision:
+        description: 分支、tag 或 commit SHA
+        default: trunk
+      tc_paths:
+        description: ducktape 測試路徑（留空跑全部）
+        default: tests/kafkatest/tests/tools
+        required: false
+      jdk:
+        description: eclipse-temurin 映像檔 tag
+        type: choice
+        options: [17-jdk-jammy, 21-jdk-jammy, 25-jdk-jammy]
+        default: 17-jdk-jammy
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, linux, kafka-e2e]
+    timeout-minutes: 1440
+    env:
+      ACCOUNT: ${{ inputs.account }}
+      REVISION: ${{ inputs.revision }}
+      TC_PATHS: ${{ inputs.tc_paths }}
+      jdk_version: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
+    steps:
+      - name: Validate inputs
+        run: |
+          [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
+          [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
+          [[ "$TC_PATHS" =~ ^[A-Za-z0-9._/:@=\ -]*$ ]] || { echo "::error::bad tc_paths"; exit 1; }
+          echo "runner: $RUNNER_NAME"
+
+      - name: Down leftover containers
+        run: |
+          if [ -x kafka/tests/docker/ducker-ak ]; then
+            (cd kafka && ./tests/docker/ducker-ak down -f) || true
+          fi
+
+      - name: Fetch kafka
+        run: |
+          rm -rf kafka && mkdir kafka && cd kafka
+          git init -q
+          git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 \
+            "https://github.com/${ACCOUNT}/kafka" "+${REVISION}:tmp"
+          git switch -q tmp
+          git log -1 --format='%H %s'
+
+      - name: Build
+        working-directory: kafka
+        run: ./gradlew clean build -x test --build-cache
+
+      - name: Run tests
+        id: tests
+        working-directory: kafka
+        continue-on-error: true
+        run: |
+          total_mb=$(free -m | awk '/^Mem:/{print $2}')
+          avail_mb=$(( total_mb - 4096 ))       # 預留 4GB 給系統和 runner
+          (( avail_mb < 0 )) && avail_mb=0
+          n=$(( avail_mb / 2048 ))              # 每個容器估 2GB
+          (( n < 14 )) && n=14                  # 至少 14 個容器
+          parallel=$(( n < 10 ? n : 10 ))
+          echo "mem ${total_mb}MB -> containers=$n max-parallel=$parallel"
+          export KAFKA_NUM_CONTAINERS=$n
+          export _DUCKTAPE_OPTIONS="--max-parallel $parallel"
+          image_name="ducker-ak:$(git rev-parse --short HEAD)" ./tests/docker/run_tests.sh $TC_PATHS
+
+      - name: Summary
+        if: always()
+        working-directory: kafka
+        run: |
+          {
+            echo "## kafka-e2e: \`${ACCOUNT}/${REVISION}\`"
+            echo "- tests: \`${TC_PATHS:-all}\`"
+            echo "- jdk: \`${jdk_version}\`"
+            echo "- result: **${{ steps.tests.outcome }}**"
+            for r in results/*/report.txt; do
+              [ -f "$r" ] || continue
+              echo; echo '```'
+              # 只放統計和失敗的測試，完整報告在 artifact
+              awk '/^test_id:/ { id = $2; next }
+                   /^status:/ { if ($2 == "FAIL" || $2 == "FLAKY") print $2, id; next }
+                   !seen_tests && /^(SESSION REPORT|ducktape|session_id|run time|tests run|passed|flaky|failed|ignored)/ { print }
+                   /^ignored:/ { seen_tests = 1 }' "$r" | head -n 200
+              echo '```'
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Archive results
+        if: always()
+        working-directory: kafka
+        run: |
+          [ -d results ] && zip -qr results.zip results || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: e2e-results
+          path: |
+            kafka/results/*/report.txt
+            kafka/results.zip
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Down containers
+        if: always()
+        run: |
+          if [ -x kafka/tests/docker/ducker-ak ]; then
+            (cd kafka && ./tests/docker/ducker-ak down -f) || true
+          fi
+
+      - name: Mark failed
+        if: steps.tests.outcome == 'failure'
+        run: exit 1
