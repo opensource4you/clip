@@ -410,10 +410,13 @@ body.onerepo .summary th[data-k="rp"],body.onerepo .summary td.rp{{display:none}
 h1{{font-size:20px;margin:0 0 4px}} .meta{{color:var(--muted);margin-bottom:16px}}
 table{{border-collapse:collapse;width:100%;background:var(--panel)}} th,td{{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line);vertical-align:top}}
 th{{background:var(--head);font-weight:600}} th.n,td.n{{text-align:right;white-space:nowrap}} td.repo{{color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
-.prs{{table-layout:fixed}} .prs thead th{{position:sticky;top:0;z-index:1}}
+.prs{{table-layout:fixed}} .prs thead th{{position:sticky;top:0;z-index:2}}
 .c-repo{{width:150px}} .c-num{{width:70px}} .c-st{{width:150px}} .c-n{{width:70px}}
 .prs td.title{{overflow-wrap:anywhere}}
-tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:14px;font-weight:600;font-size:15px}} tr.grp small{{color:var(--faint);font-weight:normal}} .gstat{{font-weight:normal;font-size:12px;margin-left:10px}} .gstat b{{font-weight:600;margin-right:10px}} .gstat .nr{{color:var(--bad-fg)}} .gstat .sl{{color:var(--red)}}
+tr.grp td{{background:var(--grp);border:0;box-shadow:inset 4px 0 0 var(--link),inset 0 2px 0 var(--line2),inset 0 -1px 0 var(--line);padding:12px 10px 10px 14px;font-weight:600;font-size:17px}}
+tr.grp{{position:sticky;top:var(--thead-h,37px);z-index:1}}
+tr.grp.hit td{{animation:hit 1.6s ease-out}} @keyframes hit{{0%,40%{{background:var(--info-bg)}}100%{{background:var(--grp)}}}}
+.summary tr.cur td{{background:var(--info-bg)}} .summary tr.cur a{{font-weight:600}} tr.grp small{{color:var(--faint);font-weight:normal}} .gstat{{font-weight:normal;font-size:12px;margin-left:10px}} .gstat b{{font-weight:600;margin-right:10px}} .gstat .nr{{color:var(--bad-fg)}} .gstat .sl{{color:var(--red)}}
 .lbl{{display:inline-block;font-size:11px;background:var(--lbl-bg);color:var(--lbl-fg);border-radius:10px;padding:0 7px;margin:2px 4px 0 0}}
 .st{{white-space:nowrap;font-size:12px;border-radius:4px;padding:1px 6px}}
 .ok{{background:var(--ok-bg);color:var(--ok-fg)}} .warn{{background:var(--warn-bg);color:var(--warn-fg)}} .bad{{background:var(--bad-bg);color:var(--bad-fg)}}
@@ -424,7 +427,7 @@ tr.grp td{{background:var(--grp);border-top:2px solid var(--line2);padding-top:1
 .side .head{{flex:none}} .side .people{{flex:1;min-height:0;overflow-y:auto}}
 .side .summary thead th{{position:sticky;top:0;z-index:1}}
 .side #repo,.side #q{{display:block;width:100%;box-sizing:border-box;margin:0 0 8px}} .side #count{{margin:0 0 10px;font-size:12px}}
-tr.grp{{scroll-margin-top:40px}}
+tr.grp{{scroll-margin-top:var(--thead-h,37px)}}
 .summary{{width:100%}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
@@ -450,7 +453,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
   .mrepo{{color:var(--faint);font-size:11px}}
   .lbl{{font-size:10px;margin-top:1px}} .prs td.title div{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}
   .mrepo{{display:block;margin:0}}
-  tr.grp td{{font-size:14px}}
+  tr.grp td{{font-size:15px}} tr.grp{{position:static}}
 }}
 </style></head><body>
 <div class="layout">
@@ -505,12 +508,46 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     ths.forEach(function(t){{t.classList.toggle('on',t.dataset.k===sortKey);t.classList.toggle('asc',sortAsc);}});
     sum.innerHTML=logins.map(function(l){{var p=per[l];
       var c=OPEN?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td class="rp">'+p.rp+'</td><td>'+p.ad+'d</td>';
-      return '<tr><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td>'+c+'</tr>';}}).join('');
+      return '<tr data-login="'+l+'"><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td>'+c+'</tr>';}}).join('');
     cnt.textContent=shown+' PRs from '+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
+    curLogin=null; if(thead) spy();   // the list was rebuilt: re-mark who is on screen
   }}
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
   q.addEventListener('input',apply); sel.addEventListener('change',apply); apply();
+
+  // keep the left list in step with the right: highlight the person on screen,
+  // flash the group header that a click on the left jumps to
+  // the head cells (not the thead) are sticky, and so are the group header rows
+  var root=document.documentElement, thead=document.querySelector('.prs thead th');
+  function setHead(){{root.style.setProperty('--thead-h',thead.getBoundingClientRect().height+'px');}}
+  setHead(); window.addEventListener('resize',setHead);
+  var curLogin='';
+  function mark(l){{
+    if(l===curLogin) return; curLogin=l;
+    sum.querySelectorAll('tr').forEach(function(r){{
+      var on=r.dataset.login===l; r.classList.toggle('cur',on);
+      if(on){{var box=r.closest('.people'), rt=r.getBoundingClientRect(), bt=box.getBoundingClientRect();
+        if(rt.top<bt.top+30||rt.bottom>bt.bottom) box.scrollTop+=rt.top-bt.top-box.clientHeight/3;}}
+    }});
+  }}
+  function spy(){{
+    var y=thead.getBoundingClientRect().bottom+4, l='';
+    document.querySelectorAll('tr.grp').forEach(function(g){{
+      if(g.style.display!=='none' && g.getBoundingClientRect().top<=y) l=g.dataset.login;
+    }});
+    mark(l);
+  }}
+  window.addEventListener('scroll',spy,{{passive:true}});
+  sum.addEventListener('click',function(ev){{
+    var a=ev.target.closest('a'); if(!a) return;
+    var g=document.getElementById(a.getAttribute('href').slice(1)); if(!g) return;
+    ev.preventDefault(); history.replaceState(null,'',a.getAttribute('href'));
+    g.scrollIntoView({{block:'start'}});
+    g.classList.remove('hit'); void g.offsetWidth; g.classList.add('hit');
+    mark(g.dataset.login);
+  }});
+  spy();
 
   var tb=document.getElementById('theme'), modes=['auto','light','dark'], icons={{auto:'◐',light:'☀',dark:'☾'}};
   function cur(){{return document.documentElement.getAttribute('data-theme')||'auto';}}
