@@ -1,43 +1,84 @@
 # Self-hosted runner（社群 VM）
 
-`kafka-loop` 和 `kafka-e2e` 跑在社群 VM 上，label 為 `self-hosted, linux, kafka`。
-runner 主動往外連 GitHub 拉 job，VM 不用開任何對外 port。
+`kafka-loop` 和 `kafka-e2e` 跑在社群 VM 上。runner 主動往外連 GitHub 拉 job，VM 不用開任何對外 port。
+
+| workflow   | runs-on 的 label | 每台 runner 數 | 說明 |
+|------------|------------------|----------------|------|
+| kafka-loop | `kafka`          | 多個           | 一個 runner 跑一個容器，要平行幾個就註冊幾個 |
+| kafka-e2e  | `kafka-e2e`      | **一個**       | e2e 會吃滿整台機器，同時只能跑一個 |
+
+一個 runner 同時只跑一個 job，所以「一台機器同時跑幾個 job」由那台註冊幾個 runner 決定。
+e2e 機器只註冊一個 runner、只給 `kafka-e2e` label，就不會有兩個 e2e 互相砍容器，
+也不會被 loop 擠到。
 
 ## 安全設定（clip 是 public repo，務必先做）
 
 任何人都能對 public repo 開 PR，而 `pull_request` 事件會用 PR 裡的 workflow 檔，
 所以有人可以在 PR 裡新增一個 `runs-on: self-hosted` 的 workflow，在 VM 上跑任意程式。
 
-1. Settings -> Actions -> General -> Fork pull request workflows from outside collaborators
-   選 **Require approval for all external contributors**。之後看到外人的 PR 等待 approve 時，
-   先確認沒改到 `.github/` 再按。
+1. 外人的 PR 要 approve 才跑 workflow（網頁在 Settings -> Actions -> General）：
+   ```bash
+   gh api -X PUT repos/opensource4you/clip/actions/permissions/fork-pr-contributor-approval \
+     -f approval_policy=all_external_contributors
+   ```
+   之後看到外人的 PR 等待 approve 時，先確認沒改到 `.github/` 再按。
 2. VM 上不要放任何憑證（SSH key、雲端 token、gh 登入），網路跟內部環境隔開。
-3. runner 用專用帳號跑，不給 sudo。
-4. log 是公開的，workflow 不要印出任何機密。`github/Jenkinsfile` 那種用參數傳 token 的作法
+3. log 是公開的，workflow 不要印出任何機密。`github/Jenkinsfile` 那種用參數傳 token 的作法
    不能直接搬過來（workflow_dispatch 的 input 會顯示在 run 頁面）。
+
+## 需要的工具
+
+- 共通：git、python3、zip、podman（rootless 即可）
+- e2e 另外需要 host 上的 JDK（含 `javac`），因為 build 是在 host 上跑 `./gradlew`。
+  - 新版 Kafka 的 ducker-ak 會自動偵測 docker 或 podman，trunk 用 podman 就能跑。
+    較舊的分支可能只支援 docker。
+  - Host 上的 JDK 版本決定能 build 哪些分支，例如 JDK 25 可以 build trunk，但舊分支的 Gradle 可能不支援。
 
 ## 安裝
 
-VM 需要：git、python3、zip、podman（loop 用）、docker（e2e 的 ducker-ak 用）。
-
-在 Settings -> Actions -> Runners -> New self-hosted runner 拿到下載指令和 token，然後用 runner 專用帳號：
+先在自己電腦上拿註冊 token（1 小時內有效，可重複用來註冊多個 runner）：
 
 ```bash
-mkdir -p ~/actions-runner-1 && cd ~/actions-runner-1
-# 照頁面上的指令下載、解壓
-./config.sh --unattended \
-  --url https://github.com/opensource4you/clip \
-  --token <TOKEN> \
-  --name "$(hostname)-1" \
-  --labels kafka
-sudo ./svc.sh install "$USER" && sudo ./svc.sh start
+gh api -X POST repos/opensource4you/clip/actions/runners/registration-token -q .token
 ```
 
-一個 runner 同時只跑一個 job。想讓同一台 VM 平行跑多個 loop 容器，就用不同目錄
-（`actions-runner-2`、`-3`…）各註冊一個 runner。e2e 會吃滿整台機器的記憶體，
-如果要避免它跟 loop 擠在同一台，可以給大機器另一個 label，再改 `kafka-e2e.yml` 的 `runs-on`。
+在 VM 上（以 Fedora 為例），`LABEL` 和 `N` 依上表設定：
 
-## 結果在哪看
+```bash
+TOKEN=貼上token
+LABEL=kafka   # e2e 機器用 kafka-e2e
+N=3           # e2e 機器用 1
+ARCH=x64      # ARM 機器改成 arm64
 
-- https://github.com/opensource4you/clip/actions ：每次 run 的 log 和 summary，任何人都能看。
+sudo dnf install -y policycoreutils-python-utils
+sudo loginctl enable-linger "$USER"   # rootless podman 在 systemd service 底下需要
+
+VER=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest | sed -n 's/.*"tag_name": "v\([^"]*\)".*/\1/p')
+for i in $(seq 1 $N); do
+  d=~/actions-runner-$LABEL-$i
+  mkdir -p $d && cd $d
+  curl -fsSL https://github.com/actions/runner/releases/download/v$VER/actions-runner-linux-$ARCH-$VER.tar.gz | tar xz
+  ./config.sh --unattended --replace \
+    --url https://github.com/opensource4you/clip \
+    --token "$TOKEN" \
+    --name "$(hostname)-$LABEL-$i" \
+    --labels "$LABEL"
+  sudo ./svc.sh install "$USER"
+  # SELinux 預設不讓 systemd 執行家目錄裡的檔案，要改標籤，不然 service 會 203/EXEC
+  sudo semanage fcontext -a -t bin_t "$d/runsvc\.sh"
+  sudo restorecon -v "$d/runsvc.sh"
+  sudo ./svc.sh start
+done
+```
+
+## 狀態和結果在哪看
+
+- Runner 狀態（Idle、Active、Offline、label）：
+  https://github.com/opensource4you/clip/settings/actions/runners （只有 admin 看得到）
+- 每次 run 的 log 和 summary，任何人都能看：https://github.com/opensource4you/clip/actions
 - run 頁面下方的 artifact（test report、ducktape results）要登入 GitHub 才能下載，保留 14 天。
+- 在 VM 上：
+  ```bash
+  systemctl list-units 'actions.runner.*'
+  podman ps
+  ```
