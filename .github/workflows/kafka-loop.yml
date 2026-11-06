@@ -90,9 +90,6 @@ jobs:
       LOOPS: ${{ inputs.loops }}
       IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
       GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/c${{ matrix.id }}-${{ inputs.jdk }}
-      # 每個 runner 一次只跑一個 job，用 runner 名稱當 container 名字，清掉的只會是這個 runner 自己留下的
-      # （同一台 VM 上的其他 runner 可能正在跑別的 loop）
-      CONTAINER_PREFIX: kafka-loop-${{ runner.name }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -136,8 +133,9 @@ jobs:
           "$CR" pull -q "$IMAGE"
           # job 被取消時 runner 只殺掉 podman/docker 這個 client，container 會繼續跑、一直佔著 Gradle cache 的鎖，
           # 下一次就會 "Timeout waiting to lock journal cache"。所以 container 取固定名字，跑之前先清掉上次留下的
-          # GitHub 機器的 runner 名稱有空白，換成 container 名字能用的字元
-          CONTAINER=$(printf '%s' "$CONTAINER_PREFIX" | tr -c 'A-Za-z0-9_.-' '-')
+          # 每個 runner 一次只跑一個 job，用 runner 名稱當 container 名字，清掉的只會是這個 runner 自己留下的
+          # （同一台 VM 上的其他 runner 可能正在跑別的 loop）。GitHub 機器的 runner 名稱有空白，換成能用的字元
+          CONTAINER="kafka-loop-$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '-')"
           echo "CONTAINER=$CONTAINER" >> "$GITHUB_ENV"
           "$CR" rm -f "$CONTAINER" >/dev/null 2>&1 || true
           : > out/failures.txt
