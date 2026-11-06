@@ -2,9 +2,10 @@
 # 觸發：Actions -> specula -> Run workflow（只有對 clip 有 write 權限、且列在 SPECULA_SLACK_USERS 的人才收得到結果）。
 # phase 的順序：code-analysis -> spec-generation -> harness-generation -> validation-workflow
 #   -> bug-confirmation -> bug-classification。
-# 平常只跑兩次：先跑 code-analysis，看完 modeling-brief.md 覺得值得做，再選 rest 把後面的 phase 依序跑完
+# code-analysis 只跑它自己，跑完停下來給人看；選其他 phase 則從那個 phase 一路跑到 bug-classification
 # （每個 phase 是一次獨立的 Claude session；任何一個沒成功或沒寫出該有的檔案就停下來，不往下跑）。
-# 單一 phase 的選項留著，用來從中間重跑。
+# 平常只跑兩次：先跑 code-analysis，看完 modeling-brief.md 覺得值得做，再選 spec-generation。
+# 中途停下來時，選停下來的那個 phase 就能接著跑完。
 # 每個 target 的工作目錄留在 VM 的 ~/specula-work/<target>，下一個 phase 接著用。
 # 結果沒送到（例如 Slack member ID 設錯）時，用 specula-resend 重送，不用重跑。
 #
@@ -13,7 +14,7 @@
 #   - 結果只用 Slack 私訊給觸發的人：Claude 的報告，加上這個 phase 需要人看的檔案
 #     （code-analysis：modeling-brief.md；validation-workflow：bug-report.md；
 #     bug-confirmation、bug-classification：confirmed-bugs.md 等）。勾 full_results 才附整個 specula-output 的 tar.gz
-#   - rest 只在最後私訊一次：最後跑的 phase 的報告，加上每個 phase 的狀態和花費
+#   - 一次跑好幾個 phase 時只在最後私訊一次：最後跑的 phase 的報告，加上每個 phase 的狀態和花費
 #   - 不上傳 artifact
 # Secrets（environment: specula，只有 main 能用）：
 #   ANTHROPIC_API_KEY、SLACK_BOT_TOKEN、SPECULA_SLACK_USERS（{"github 帳號": "Slack member ID"}）
@@ -35,11 +36,10 @@ on:
           - kafka-kraft-dynamic-quorum
           - kafka-share-groups
       phase:
-        description: 要跑的 phase（rest = code-analysis 之後的全部 phase 依序跑完）
+        description: 從哪個 phase 開始（code-analysis 只跑它自己；其他的會一路跑到 bug-classification）
         type: choice
         options:
           - code-analysis
-          - rest
           - spec-generation
           - harness-generation
           - validation-workflow
@@ -94,10 +94,17 @@ jobs:
           [[ "$TARGET" =~ ^kafka-[a-z-]+$ ]] || { echo "::error::bad target"; exit 1; }
           [[ "$PHASE" =~ ^[a-z-]+$ ]] || { echo "::error::bad phase"; exit 1; }
           [[ "$MAX_TURNS" =~ ^[0-9]+$ ]] || { echo "::error::bad max_turns"; exit 1; }
-          case "$PHASE" in
-            rest) phases="spec-generation harness-generation validation-workflow bug-confirmation bug-classification" ;;
-            *)    phases="$PHASE" ;;
+          # code-analysis 之後要人決定值不值得做；其他 phase 從選的那個一路跑到最後
+          all="spec-generation harness-generation validation-workflow bug-confirmation bug-classification"
+          case " code-analysis $all " in
+            *" $PHASE "*) ;;
+            *) echo "::error::bad phase"; exit 1 ;;
           esac
+          if [[ "$PHASE" == "code-analysis" ]]; then
+            phases="code-analysis"
+          else
+            phases="$PHASE${all#*"$PHASE"}"
+          fi
           echo "PHASES=$phases" >> "$GITHUB_ENV"
           echo "phases: $phases"
           echo "WORK=$HOME/specula-work/$TARGET" >> "$GITHUB_ENV"
