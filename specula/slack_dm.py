@@ -7,6 +7,8 @@ Env:
   SLACK_BOT_TOKEN      bot token (xoxb-...) with chat:write, files:write, im:write
   SPECULA_SLACK_USERS  JSON object mapping GitHub login -> Slack member ID
 
+With only <github-login>, checks the recipient before the run spends anything:
+the login must be in SPECULA_SLACK_USERS and its member ID must open a DM.
 Exit code 2 means the login is not in SPECULA_SLACK_USERS (not allowed).
 Never prints the token, the member ID or the message, because the job log is public.
 """
@@ -41,8 +43,13 @@ def call(method, token, data, as_json=True):
 
 
 def main():
-    if len(sys.argv) == 2:  # allowlist check only
-        sys.exit(0 if slack_user(sys.argv[1]) else 2)
+    if len(sys.argv) == 2:  # recipient check
+        user = slack_user(sys.argv[1])
+        if not user:
+            sys.exit(2)
+        call("conversations.open", os.environ["SLACK_BOT_TOKEN"], {"users": user})
+        print("recipient ok")
+        return
 
     login, message_file = sys.argv[1], sys.argv[2]
     attachment = sys.argv[3] if len(sys.argv) > 3 else None

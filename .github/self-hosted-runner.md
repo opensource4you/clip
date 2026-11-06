@@ -54,7 +54,8 @@ public 的 summary 只有狀態、輪數、花費和時間。
 
 - Secrets 放在 environment `specula`（只有 `main` 能用）：
   `ANTHROPIC_API_KEY`、`SLACK_BOT_TOKEN`、`SPECULA_SLACK_USERS`（`{"github 帳號": "Slack member ID"}`）。
-  `SPECULA_SLACK_USERS` 也是名單：不在裡面的人觸發，job 一開始就失敗，不會花錢。
+  `SPECULA_SLACK_USERS` 也是名單：不在裡面的人觸發，或 member ID 開不了私訊，job 一開始就失敗，不會花錢。
+- 結果沒送到（例如 member ID 設錯），修好 secret 後 phase 選 `resend`：不跑 Claude，重送這個 target 最近一次的結果。
 - 每個 target 的工作目錄在 `~/specula-work/<target>`，phase 之間接著用；表單勾 `reset` 才會從頭開始。
   每次 Claude 的完整 log 在 `~/specula-work/<target>/.specula-output/runs/`。
 
