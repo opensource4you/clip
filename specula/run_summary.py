@@ -17,10 +17,32 @@ LIMIT = 3000
 
 
 def slack_mrkdwn(text):
-    """Claude writes Markdown; Slack wants *bold* and has no headings."""
-    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
-    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.M)
-    return text
+    """Claude writes Markdown; Slack wants *bold*, has no headings and no tables."""
+    out, table = [], []
+    for line in text.split("\n") + [""]:
+        if line.lstrip().startswith("|"):
+            # drop the |---|---| separator row; keep the table as monospaced text
+            if not re.fullmatch(r"\s*\|[\s:|-]+\|?\s*", line):
+                table.append(line.strip())
+            continue
+        if table:
+            out += ["```"] + table + ["```"]
+            table = []
+        line = re.sub(r"\*\*(.+?)\*\*", r"*\1*", line)
+        line = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", line)
+        out.append(line)
+    return "\n".join(out[:-1])
+
+
+def run_minutes(log, result):
+    """Wall-clock minutes from the .time file the workflow writes; fall back to Claude's own number."""
+    try:
+        with open(os.path.splitext(log)[0] + ".time") as f:
+            start, end = map(int, f.read().split())
+        return f"{(end - start) / 60:.0f} min"
+    except (OSError, ValueError):
+        ms = result.get("duration_ms")
+        return f"{ms / 60000:.0f} min" if isinstance(ms, (int, float)) else "?"
 
 
 def last_result(path):
@@ -53,8 +75,7 @@ def main():
     turns = r.get("num_turns", "?")
     cost = r.get("total_cost_usd")
     cost = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
-    minutes = r.get("duration_ms")
-    minutes = f"{minutes / 60000:.0f} min" if isinstance(minutes, (int, float)) else "?"
+    minutes = run_minutes(log, r)
 
     with open(public_md, "w", encoding="utf-8") as f:
         f.write(f"## specula: `{env('TARGET')}` / `{env('PHASE')}`\n")

@@ -46,7 +46,7 @@ on:
         default: claude-opus-5-5
       max_turns:
         description: 最多幾輪（防止卡在迴圈一直花錢）
-        default: "400"
+        default: "800"
       reset:
         description: 清掉這個 target 的工作目錄，從頭開始（只在 code-analysis 時有效）
         type: boolean
@@ -151,6 +151,7 @@ jobs:
           - Do not use sudo or install system packages."
 
           set +e
+          start=$(date +%s)
           claude -p "$prompt" \
             --append-system-prompt "$rules" \
             --model "$MODEL" \
@@ -161,6 +162,8 @@ jobs:
             --disallowedTools "Bash(sudo:*)" "Bash(git push:*)" \
             > "$log" 2>&1
           rc=$?
+          # Claude 回報的 duration 不可靠，自己記實際的開始和結束時間（resend 也會讀）
+          echo "$start $(date +%s)" > "${log%.jsonl}.time"
           echo "claude exit code: $rc"
           exit $rc
 

@@ -138,6 +138,9 @@ jobs:
           CONTAINER="kafka-loop-$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '-')"
           echo "CONTAINER=$CONTAINER" >> "$GITHUB_ENV"
           "$CR" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          # 舊版 workflow 留下的 container 沒有名字，用「掛了同一個 Gradle cache」來找；
+          # 每個 runner 的 cache 目錄不同，不會動到同一台機器上其他 runner 的 container
+          bash clip/kafka/remove_cache_containers.sh "$CR" "$GRADLE_CACHE_DIR"
           : > out/failures.txt
           failed=0
           for i in $(seq 1 "$LOOPS"); do
@@ -170,9 +173,9 @@ jobs:
       - name: Stop container
         if: always()
         run: |
-          [ -n "${CONTAINER:-}" ] || exit 0
           CR=$(command -v podman || command -v docker)
-          "$CR" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          [ -z "${CONTAINER:-}" ] || "$CR" rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          bash clip/kafka/remove_cache_containers.sh "$CR" "$GRADLE_CACHE_DIR"
 
       - name: Upload summary data
         if: always()

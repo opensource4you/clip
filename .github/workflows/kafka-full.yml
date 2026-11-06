@@ -120,6 +120,8 @@ jobs:
           CONTAINER="kafka-full-$(printf '%s' "$RUNNER_NAME" | tr -c 'A-Za-z0-9_.-' '-')"
           echo "CONTAINER=$CONTAINER" >> "$GITHUB_ENV"
           podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          # 舊版 workflow 留下的 container 沒有名字，用「掛了同一個 Gradle cache」來找
+          bash clip/kafka/remove_cache_containers.sh podman "$GRADLE_CACHE_DIR"
           # podman 預設每個容器最多 2048 個 process/thread，Gradle 加上多個測試 fork 會超過，
           # 出現 pthread_create failed (EAGAIN)，所以把上限拿掉（跟 kafka/test_kafka.sh 一樣）
           # 用一般使用者跑，不要用 root：root 可以無視檔案權限，會讓改權限再看會不會失敗的測試誤判。
@@ -140,8 +142,8 @@ jobs:
       - name: Stop container
         if: always()
         run: |
-          [ -n "${CONTAINER:-}" ] || exit 0
-          podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          [ -z "${CONTAINER:-}" ] || podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          bash clip/kafka/remove_cache_containers.sh podman "$GRADLE_CACHE_DIR"
 
       - name: Summary
         if: always()
