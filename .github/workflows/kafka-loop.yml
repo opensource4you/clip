@@ -5,7 +5,7 @@
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-loop
-run-name: "loop ${{ inputs.account }}/${{ inputs.revision }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
+run-name: "loop ${{ inputs.account }}/${{ inputs.revision }}${{ inputs.run_flaky && ' flaky' || '' }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
 
 on:
   workflow_dispatch:
@@ -37,6 +37,10 @@ on:
         type: choice
         options: [github, community-vm]
         default: github
+      run_flaky:
+        description: 只跑標了 @Flaky 的測試（自動加 -Pkafka.test.run.flaky=true）。要 loop 的測試有 @Flaky 就要勾，不然它會被跳過、看起來全部通過
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -82,6 +86,7 @@ jobs:
       ACCOUNT: ${{ inputs.account }}
       REVISION: ${{ inputs.revision }}
       COMMAND: ${{ inputs.command }}
+      RUN_FLAKY: ${{ inputs.run_flaky }}
       LOOPS: ${{ inputs.loops }}
       IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
       GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/c${{ matrix.id }}-${{ inputs.jdk }}
@@ -120,6 +125,10 @@ jobs:
           # 用跟 host 上 runner 一樣的 uid，掛進去的 kafka 目錄和 Gradle cache 才寫得了。
           # rootless podman 用 --userns=keep-id 做到；docker 直接指定 --user。
           if [ "$(basename "$CR")" = podman ]; then USEROPT="--userns=keep-id"; else USEROPT="--user $(id -u):$(id -g)"; fi
+          # Kafka 預設會跳過 @Flaky 的測試；帶這個屬性則改成「只跑」@Flaky 的測試
+          if [ "$RUN_FLAKY" = true ]; then COMMAND="$COMMAND -Pkafka.test.run.flaky=true"; fi
+          export COMMAND
+          echo "command: $COMMAND"
           mkdir -p "$GRADLE_CACHE_DIR"
           "$CR" pull -q "$IMAGE"
           : > out/failures.txt
@@ -188,6 +197,7 @@ jobs:
           ACCOUNT: ${{ inputs.account }}
           REVISION: ${{ inputs.revision }}
           COMMAND: ${{ inputs.command }}
+          RUN_FLAKY: ${{ inputs.run_flaky }}
           JDK: ${{ inputs.jdk }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
@@ -215,7 +225,10 @@ jobs:
           # normally one commit; more than one means the branch moved while the containers started
           for sha, subject in commits.items():
               print(f"- commit: [`{sha[:12]}`](https://github.com/{e['ACCOUNT']}/kafka/commit/{sha}) {subject}")
+          flaky = e.get("RUN_FLAKY") == "true"
           print(f"- command: `{e['COMMAND']}`\n- jdk: `{e['JDK']}`")
+          if flaky:
+              print("- 只跑 `@Flaky` 的測試（`-Pkafka.test.run.flaky=true`）")
           print(f"- **{failed} / {runs}** runs failed\n")
           if counts:
               print("| failures | task | test |\n|---:|---|---|")
@@ -226,7 +239,8 @@ jobs:
                   by_task[task].append(test)
               cmd = " ".join(f"{t} " + " ".join(f"--tests {x}" for x in sorted(v))
                              for t, v in sorted(by_task.items()))
-              print(f"\n重跑失敗的測試：\n```\n./gradlew cleanTest {cmd}\n```")
+              extra = " -Pkafka.test.run.flaky=true" if flaky else ""
+              print(f"\n重跑失敗的測試：\n```\n./gradlew cleanTest {cmd}{extra}\n```")
           elif runs:
               print("沒有失敗的測試 :tada:")
           EOF

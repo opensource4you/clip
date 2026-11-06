@@ -6,7 +6,7 @@
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-full
-run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.suite }} retry=${{ inputs.retries }} (${{ inputs.jdk }})"
+run-name: "full ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.suite }}${{ inputs.flaky && ' flaky' || '' }} retry=${{ inputs.retries }} (${{ inputs.jdk }})"
 
 on:
   workflow_dispatch:
@@ -32,6 +32,10 @@ on:
         type: choice
         options: [17-jdk-jammy, 21-jdk-jammy, 25-jdk-jammy]
         default: 17-jdk-jammy
+      flaky:
+        description: 只跑標了 @Flaky 的測試（官方 CI 的 flaky job）；不勾就跟一般 ./gradlew test 一樣跳過它們
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -45,6 +49,7 @@ jobs:
       REVISION: ${{ inputs.revision }}
       SUITE: ${{ inputs.suite }}
       RETRIES: ${{ inputs.retries }}
+      FLAKY: ${{ inputs.flaky }}
       IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
       GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/full-${{ inputs.jdk }}
     steps:
@@ -103,6 +108,10 @@ jobs:
           (( forks < 1 )) && forks=1
           echo "cpu $(nproc), mem ${mem_gb}G -> maxParallelForks=$forks"
           export FORKS=$forks
+          # Kafka 預設會跳過 @Flaky 的測試；帶這個屬性則改成「只跑」@Flaky 的測試
+          EXTRA=""
+          [[ "$FLAKY" == "true" ]] && EXTRA="-Pkafka.test.run.flaky=true"
+          export EXTRA
           mkdir -p "$GRADLE_CACHE_DIR"
           podman pull -q "$IMAGE"
           # podman 預設每個容器最多 2048 個 process/thread，Gradle 加上多個測試 fork 會超過，
@@ -111,16 +120,16 @@ jobs:
           # --userns=keep-id 讓容器裡的使用者跟 host 上的 runner 同一個 uid，掛進去的目錄才寫得了。
           podman run --rm --pids-limit=-1 --ulimit nproc=16384:16384 --ulimit nofile=65536:65536 \
             --userns=keep-id -e HOME=/tmp -e GRADLE_USER_HOME=/gradle-home \
-            -e TASKS -e RETRIES -e FORKS \
+            -e TASKS -e RETRIES -e FORKS -e EXTRA \
             -v "$PWD/kafka:/tmp/kafka:z" \
             -v "$GRADLE_CACHE_DIR:/gradle-home:z" \
             "$IMAGE" \
-            bash -c 'set -f; read -ra tasks <<< "$TASKS"; cd /tmp/kafka && chmod +x ./gradlew && \
+            bash -c 'set -f; read -ra tasks <<< "$TASKS"; read -ra extra <<< "$EXTRA"; cd /tmp/kafka && chmod +x ./gradlew && \
               ./gradlew --continue \
                 -PmaxParallelForks="$FORKS" \
                 -PmaxTestRetries="$RETRIES" -PmaxTestRetryFailures=10 \
                 -x spotbugsMain -x spotbugsTest \
-                "${tasks[@]}"' 2>&1 | tee out/gradle.log
+                "${extra[@]}" "${tasks[@]}"' 2>&1 | tee out/gradle.log
 
       - name: Summary
         if: always()
@@ -130,6 +139,7 @@ jobs:
             echo "- repo: [${ACCOUNT}/kafka](https://github.com/${ACCOUNT}/kafka)、revision: \`${REVISION}\`"
             echo "- commit: [\`${COMMIT:0:12}\`](https://github.com/${ACCOUNT}/kafka/commit/${COMMIT}) ${COMMIT_SUBJECT}"
             echo "- suite: ${SUITE}（\`${TASKS}\`）、retries: ${RETRIES}、jdk: \`${IMAGE##*:}\`"
+            [[ "$FLAKY" == "true" ]] && echo "- 只跑 \`@Flaky\` 的測試（\`-Pkafka.test.run.flaky=true\`）"
             echo "- result: **${{ steps.tests.outcome }}**"
             python3 clip/kafka/junit_failures.py kafka --summary
             # Gradle 失敗但不是測試失敗（checkstyle、編譯、測試 JVM 掛掉…）時，XML 裡看不到原因，從 log 撈出來
