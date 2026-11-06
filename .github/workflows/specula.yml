@@ -1,0 +1,187 @@
+# 在社群 VM 上用 Specula（TLA+）找 Kafka 的 bug：https://github.com/chia7712/Specula/tree/kafka
+# 觸發：Actions -> specula -> Run workflow（只有對 clip 有 write 權限、且列在 SPECULA_SLACK_USERS 的人才收得到結果）。
+# 一次跑一個 phase，照順序：code-analysis -> spec-generation -> harness-generation
+#   -> validation-workflow -> bug-confirmation。每個 phase 跑完先看結果再跑下一個。
+# 每個 target 的工作目錄留在 VM 的 ~/specula-work/<target>，下一個 phase 接著用。
+#
+# clip 是 public repo，log 和 summary 任何人都看得到，但 Specula 找到的可能是還沒公開的漏洞，所以：
+#   - Claude 的所有輸出都寫進 VM 上的檔案，不印到 log
+#   - 結果（.specula-output 的 tar.gz 和 Claude 的報告）只用 Slack 私訊給觸發的人
+#   - 不上傳 artifact
+# Secrets（environment: specula，只有 main 能用）：
+#   ANTHROPIC_API_KEY、SLACK_BOT_TOKEN、SPECULA_SLACK_USERS（{"github 帳號": "Slack member ID"}）
+# Runner 設定見 .github/self-hosted-runner.md
+
+name: specula
+run-name: "specula ${{ inputs.target }} ${{ inputs.phase }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: guidance 檔（一個 target 一個工作目錄）
+        type: choice
+        options:
+          - kafka-consumer-group-rebalance
+          - kafka-log-cleaner
+          - kafka-transaction-coordinator
+          - kafka-kraft-dynamic-quorum
+          - kafka-share-groups
+      phase:
+        description: 要跑的 phase
+        type: choice
+        options:
+          - code-analysis
+          - spec-generation
+          - harness-generation
+          - validation-workflow
+          - bug-confirmation
+      model:
+        description: Claude 模型
+        type: choice
+        options: [claude-opus-5-5, claude-sonnet-5-5]
+        default: claude-opus-5-5
+      max_turns:
+        description: 最多幾輪（防止卡在迴圈一直花錢）
+        default: "400"
+      reset:
+        description: 清掉這個 target 的工作目錄，從頭開始（只在 code-analysis 時有效）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: specula
+  cancel-in-progress: false
+
+jobs:
+  specula:
+    runs-on: [self-hosted, linux, specula]
+    environment: specula
+    timeout-minutes: 2880
+    env:
+      TARGET: ${{ inputs.target }}
+      PHASE: ${{ inputs.phase }}
+      MODEL: ${{ inputs.model }}
+      MAX_TURNS: ${{ inputs.max_turns }}
+      RESET: ${{ inputs.reset }}
+      ACTOR: ${{ github.triggering_actor }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: clip
+          sparse-checkout: specula
+
+      - name: Validate inputs
+        run: |
+          [[ "$TARGET" =~ ^kafka-[a-z-]+$ ]] || { echo "::error::bad target"; exit 1; }
+          [[ "$PHASE" =~ ^[a-z-]+$ ]] || { echo "::error::bad phase"; exit 1; }
+          [[ "$MAX_TURNS" =~ ^[0-9]+$ ]] || { echo "::error::bad max_turns"; exit 1; }
+          echo "WORK=$HOME/specula-work/$TARGET" >> "$GITHUB_ENV"
+          echo "runner: $RUNNER_NAME"
+
+      # 先確認結果送得出去，不在名單上就不花錢跑
+      - name: Check recipient
+        env:
+          SPECULA_SLACK_USERS: ${{ secrets.SPECULA_SLACK_USERS }}
+        run: |
+          python3 clip/specula/slack_dm.py "$ACTOR" || {
+            echo "::error::@$ACTOR 不在 SPECULA_SLACK_USERS，結果沒地方送，不跑"; exit 1; }
+
+      - name: Prepare work dir
+        run: |
+          if [[ "$RESET" == "true" && "$PHASE" == "code-analysis" ]]; then
+            echo "reset: removing $WORK"
+            rm -rf "$WORK"
+          fi
+          if [[ ! -d "$WORK/.git" ]]; then
+            [[ "$PHASE" == "code-analysis" ]] || {
+              echo "::error::$TARGET 還沒跑過 code-analysis，沒有前一個 phase 的結果"; exit 1; }
+            git clone -q -b kafka https://github.com/chia7712/Specula "$WORK"
+          else
+            git -C "$WORK" pull -q --ff-only || echo "::warning::Specula 無法 fast-forward，沿用目前版本"
+          fi
+          git -C "$WORK" log -1 --format='Specula %h %s'
+          bash "$WORK/cloud/setup.sh"
+
+      - name: Install Claude Code
+        run: |
+          if ! command -v claude >/dev/null && [[ ! -x "$HOME/.local/bin/claude" ]]; then
+            curl -fsSL https://claude.ai/install.sh | bash
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Claude 的輸出（含 build、TLC 的 log）全部進檔案，public log 只看得到 exit code
+      - name: Run phase
+        id: claude
+        continue-on-error: true
+        working-directory: ${{ env.WORK }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          claude --version
+          mem_gb=$(free -g | awk '/^Mem:/{print $2}')
+          cpus=$(nproc)
+          heap=$(( mem_gb * 6 / 10 ))
+          workers=$(( cpus * 3 / 4 ))
+          gradle_workers=$(( cpus / 2 ))
+          mkdir -p .specula-output/runs
+          log=".specula-output/runs/${GITHUB_RUN_ID}-${PHASE}.jsonl"
+          echo "CLAUDE_LOG=$WORK/$log" >> "$GITHUB_ENV"
+
+          prompt="Read guidance/${TARGET}.md. Run /${PHASE} for this target and stop when the phase is complete. If .specula-output/ already holds results from earlier phases for this target, build on them."
+          rules="This session runs unattended in a GitHub Actions job on a self-hosted VM. Nobody will answer questions: make reasonable choices, write them down in .specula-output/, and finish the phase.
+          These rules override CLAUDE.md where they conflict:
+          - Do not commit, push or create branches. The workflow collects .specula-output/ itself.
+          - The VM has ${mem_gb} GB RAM and ${cpus} CPUs. Run at most one TLC instance at a time, with -Xmx${heap}g and -workers ${workers}. Pass --max-workers=${gradle_workers} to Gradle.
+          - Do not use sudo or install system packages."
+
+          set +e
+          claude -p "$prompt" \
+            --append-system-prompt "$rules" \
+            --model "$MODEL" \
+            --max-turns "$MAX_TURNS" \
+            --mcp-config .mcp.json --strict-mcp-config \
+            --dangerously-skip-permissions \
+            --output-format stream-json --verbose \
+            --disallowedTools "Bash(sudo:*)" "Bash(git push:*)" \
+            > "$log" 2>&1
+          rc=$?
+          echo "claude exit code: $rc"
+          exit $rc
+
+      - name: Summary
+        id: summary
+        if: always() && env.CLAUDE_LOG != ''
+        continue-on-error: true
+        run: |
+          rc=0
+          python3 clip/specula/run_summary.py "$CLAUDE_LOG" summary.md "$RUNNER_TEMP/message.txt" || rc=$?
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Pack results
+        if: always() && env.CLAUDE_LOG != ''
+        run: |
+          [[ -d "$WORK/kafka/.git" ]] && git -C "$WORK/kafka" diff > "$WORK/.specula-output/kafka-harness.patch"
+          tar -czf "$RUNNER_TEMP/specula-${TARGET}-${PHASE}-${GITHUB_RUN_ID}.tar.gz" -C "$WORK" .specula-output
+          echo "PACK=$RUNNER_TEMP/specula-${TARGET}-${PHASE}-${GITHUB_RUN_ID}.tar.gz" >> "$GITHUB_ENV"
+          du -h "$RUNNER_TEMP"/specula-*.tar.gz
+
+      - name: Send to Slack
+        if: always() && env.PACK != ''
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SPECULA_SLACK_USERS: ${{ secrets.SPECULA_SLACK_USERS }}
+        run: python3 clip/specula/slack_dm.py "$ACTOR" "$RUNNER_TEMP/message.txt" "$PACK"
+
+      - name: Clean up
+        if: always()
+        run: rm -f "$RUNNER_TEMP"/specula-*.tar.gz "$RUNNER_TEMP/message.txt"
+
+      - name: Mark failed
+        if: steps.claude.outcome == 'failure' || steps.summary.outcome == 'failure'
+        run: exit 1
