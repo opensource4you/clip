@@ -103,6 +103,13 @@ jobs:
           git log -1 --format='%H %s'
           # 分支之後會往前走，summary 要記下這次實際測的是哪個 commit
           git log -1 --format='%H %s' > ../out/commit.txt
+          # Kafka 的 repo 沒附 gradle-wrapper.jar，gradlew 會用 curl 下載；
+          # 但有些 eclipse-temurin 映像檔（例如 25-jdk-jammy）沒有 curl，所以先在 host 上抓好
+          jar=gradle/wrapper/gradle-wrapper.jar
+          if [ ! -e "$jar" ]; then
+            url=$(grep -oE 'https://[^"[:space:]]+/gradle-wrapper\.jar' gradlew | head -1 || true)
+            if [ -n "$url" ]; then curl -fsSL --retry 3 -o "$jar" "$url"; fi
+          fi
 
       - name: Run ${{ inputs.loops }}x
         run: |
