@@ -120,7 +120,7 @@ jobs:
                 -PmaxParallelForks="$FORKS" \
                 -PmaxTestRetries="$RETRIES" -PmaxTestRetryFailures=10 \
                 -x spotbugsMain -x spotbugsTest \
-                "${tasks[@]}"'
+                "${tasks[@]}"' 2>&1 | tee out/gradle.log
 
       - name: Summary
         if: always()
@@ -132,6 +132,13 @@ jobs:
             echo "- suite: ${SUITE}（\`${TASKS}\`）、retries: ${RETRIES}、jdk: \`${IMAGE##*:}\`"
             echo "- result: **${{ steps.tests.outcome }}**"
             python3 clip/kafka/junit_failures.py kafka --summary
+            # Gradle 失敗但不是測試失敗（checkstyle、編譯、測試 JVM 掛掉…）時，XML 裡看不到原因，從 log 撈出來
+            if [ -f out/gradle.log ] && grep -q '^\* What went wrong:' out/gradle.log; then
+              echo "### Gradle 錯誤"
+              echo '```'
+              awk '/^\* What went wrong:/{p=1} /^\* Try:/{p=0} p' out/gradle.log | head -200
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           (cd kafka && find . -path '*/build/test-results/*' -name 'TEST-*.xml' -print0 \
             | tar -czf ../out/test-results.tgz --null -T -) || true
@@ -140,7 +147,9 @@ jobs:
         if: always()
         with:
           name: full-test-results
-          path: out/test-results.tgz
+          path: |
+            out/test-results.tgz
+            out/gradle.log
           if-no-files-found: ignore
           retention-days: 14
 

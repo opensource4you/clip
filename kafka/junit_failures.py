@@ -11,6 +11,8 @@
 """
 import collections
 import pathlib
+import re
+import shlex
 import sys
 import xml.etree.ElementTree as ET
 
@@ -46,8 +48,11 @@ def collect(root: str):
 
 
 def short(task, classname, name):
-    # 參數化測試的名字像 testFoo(String)[1]，輸出時只留方法名，方便組 --tests
-    return task, f"{classname}.{name.split('(')[0].split('[')[0]}"
+    # 參數化測試的名字像 testFoo(String)[1]，輸出時只留方法名，方便組 --tests。
+    # Kafka 的 junit-platform.properties 把 display name 設成 "{displayName}.{argumentsWithNames}"，
+    # properties 檔裡的引號是字面值，所以名字會變成 "testFoo(String).arg=x"，開頭多一個引號。
+    m = re.match(r'\W*([A-Za-z_$][\w$]*)', name)
+    return task, f"{classname}.{m.group(1) if m else name}"
 
 
 def pick(results, flaky):
@@ -60,7 +65,7 @@ def rerun_command(tests):
     for task, test in tests:
         by_task[task].append(test)
     return "./gradlew cleanTest " + " ".join(
-        f"{t} " + " ".join(f"--tests {x}" for x in sorted(v)) for t, v in sorted(by_task.items()))
+        f"{t} " + " ".join(f"--tests {shlex.quote(x)}" for x in sorted(v)) for t, v in sorted(by_task.items()))
 
 
 def summary(results):
