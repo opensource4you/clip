@@ -7,7 +7,9 @@
 #
 # clip 是 public repo，log 和 summary 任何人都看得到，但 Specula 找到的可能是還沒公開的漏洞，所以：
 #   - Claude 的所有輸出都寫進 VM 上的檔案，不印到 log
-#   - 結果（.specula-output 的 tar.gz 和 Claude 的報告）只用 Slack 私訊給觸發的人
+#   - 結果只用 Slack 私訊給觸發的人：Claude 的報告，加上這個 phase 需要人看的檔案
+#     （code-analysis：modeling-brief.md；validation-workflow：bug-report.md；
+#     bug-confirmation：confirmed-bugs.md 等）。勾 full_results 才附整個 specula-output 的 tar.gz
 #   - 不上傳 artifact
 # Secrets（environment: specula，只有 main 能用）：
 #   ANTHROPIC_API_KEY、SLACK_BOT_TOKEN、SPECULA_SLACK_USERS（{"github 帳號": "Slack member ID"}）
@@ -50,6 +52,10 @@ on:
         description: 清掉這個 target 的工作目錄，從頭開始（只在 code-analysis 時有效）
         type: boolean
         default: false
+      full_results:
+        description: 另外附上整個 specula-output 的 tar.gz（平常只附需要人看的檔案）
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -69,6 +75,7 @@ jobs:
       MODEL: ${{ inputs.model }}
       MAX_TURNS: ${{ inputs.max_turns }}
       RESET: ${{ inputs.reset }}
+      FULL_RESULTS: ${{ inputs.full_results }}
       ACTOR: ${{ github.triggering_actor }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
@@ -186,27 +193,48 @@ jobs:
           cat summary.md >> "$GITHUB_STEP_SUMMARY"
           exit $rc
 
+      # 依 phase 挑出需要人看的檔案；整包 tar.gz 只在勾 full_results 時附上
       - name: Pack results
         if: always() && env.CLAUDE_LOG != ''
         run: |
-          [[ -d "$WORK/kafka/.git" ]] && git -C "$WORK/kafka" diff > "$WORK/.specula-output/kafka-harness.patch"
-          pack="$RUNNER_TEMP/specula-${TARGET}-${REPORT_PHASE}-${GITHUB_RUN_ID}.tar.gz"
-          tar -czf "$pack" -C "$WORK" .specula-output
-          echo "PACK=$pack" >> "$GITHUB_ENV"
-          du -h "$RUNNER_TEMP"/specula-*.tar.gz
+          out="$WORK/.specula-output"
+          [[ -d "$WORK/kafka/.git" ]] && git -C "$WORK/kafka" diff > "$out/kafka-harness.patch"
+          case "$REPORT_PHASE" in
+            code-analysis)       want="modeling-brief.md" ;;
+            validation-workflow) want="spec/bug-report.md" ;;
+            bug-confirmation)    want="confirmed-bugs.md bug-severity.md summary.md" ;;
+            *)                   want="" ;;
+          esac
+          attach=""
+          for f in $want; do
+            [[ -f "$out/$f" ]] || continue
+            dst="$RUNNER_TEMP/specula-attach/${TARGET}-$(basename "$f")"
+            mkdir -p "$(dirname "$dst")" && cp "$out/$f" "$dst" && attach="$attach $dst"
+          done
+          if [[ "$FULL_RESULTS" == "true" ]]; then
+            pack="$RUNNER_TEMP/specula-attach/specula-${TARGET}-${REPORT_PHASE}-${GITHUB_RUN_ID}.tar.gz"
+            mkdir -p "$(dirname "$pack")"
+            # 解開後是一般的 specula-output/，不是隱藏的 .specula-output/
+            tar -czf "$pack" -C "$WORK" --transform 's,^\.specula-output,specula-output,' .specula-output
+            attach="$attach $pack"
+          fi
+          echo "ATTACH=$attach" >> "$GITHUB_ENV"
+          echo "PACKED=true" >> "$GITHUB_ENV"
+          ls -la "$RUNNER_TEMP/specula-attach" 2>/dev/null || echo "no extra files for $REPORT_PHASE"
 
       - name: Send to Slack
-        if: always() && env.PACK != ''
+        if: always() && env.PACKED == 'true'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SPECULA_SLACK_USERS: ${{ secrets.SPECULA_SLACK_USERS }}
         run: |
+          # shellcheck disable=SC2086
           python3 clip/specula/slack_dm.py "$ACTOR" "$RUNNER_TEMP/message.txt" \
-            "$RUNNER_TEMP/report-${TARGET}-${REPORT_PHASE}.md" "$PACK"
+            "$RUNNER_TEMP/report-${TARGET}-${REPORT_PHASE}.md" $ATTACH
 
       - name: Clean up
         if: always()
-        run: rm -f "$RUNNER_TEMP"/specula-*.tar.gz "$RUNNER_TEMP"/report-*.md "$RUNNER_TEMP/message.txt"
+        run: rm -rf "$RUNNER_TEMP/specula-attach" "$RUNNER_TEMP"/report-*.md "$RUNNER_TEMP/message.txt"
 
       - name: Mark failed
         if: steps.claude.outcome == 'failure' || (inputs.phase != 'resend' && steps.summary.outcome == 'failure')

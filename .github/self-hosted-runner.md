@@ -56,6 +56,9 @@ public 的 summary 只有狀態、輪數、花費和時間。
   `ANTHROPIC_API_KEY`、`SLACK_BOT_TOKEN`、`SPECULA_SLACK_USERS`（`{"github 帳號": "Slack member ID"}`）。
   `SPECULA_SLACK_USERS` 也是名單：不在裡面的人觸發，或 member ID 開不了私訊，job 一開始就失敗，不會花錢。
 - 結果沒送到（例如 member ID 設錯），修好 secret 後 phase 選 `resend`：不跑 Claude，重送這個 target 最近一次的結果。
+- 私訊附 Claude 的報告和這個 phase 需要人看的檔案（code-analysis：`modeling-brief.md`；validation-workflow：`bug-report.md`；
+  bug-confirmation：`confirmed-bugs.md`、`bug-severity.md`、`summary.md`）。下一個 phase 讀的是 VM 上的工作目錄，不是這些附件。
+  表單勾 `full_results` 才另外附整個 `specula-output` 的 tar.gz。
 - 每個 target 的工作目錄在 `~/specula-work/<target>`，phase 之間接著用；表單勾 `reset` 才會從頭開始。
   每次 Claude 的完整 log 在 `~/specula-work/<target>/.specula-output/runs/`。
 
