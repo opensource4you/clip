@@ -45,8 +45,8 @@ def run_minutes(log, result):
         return f"{ms / 60000:.0f} min" if isinstance(ms, (int, float)) else "?"
 
 
-def last_result(path):
-    result = {}
+def read_results(path):
+    results = []
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             for line in f:
@@ -58,16 +58,36 @@ def last_result(path):
                 except ValueError:
                     continue
                 if obj.get("type") == "result":
-                    result = obj
+                    results.append(obj)
     except FileNotFoundError:
         pass
-    return result
+    return results
+
+
+def combine(results):
+    """A run can end with more than one result: when a background command (e.g. TLC)
+    finishes after Claude's report, Claude answers it in an extra short turn. The real
+    report is the result with the most turns; later ones are appended as notes.
+    Turns are per result, so they add up; the cost is cumulative, so take the largest."""
+    if not results:
+        return {}
+    main = max(results, key=lambda r: r.get("num_turns") or 0)
+    r = dict(main)
+    r["num_turns"] = sum(x.get("num_turns") or 0 for x in results)
+    costs = [x["total_cost_usd"] for x in results if isinstance(x.get("total_cost_usd"), (int, float))]
+    if costs:
+        r["total_cost_usd"] = max(costs)
+    notes = [x.get("result", "").strip() for x in results if x is not main and x.get("result", "").strip()]
+    if notes:
+        r["result"] = (main.get("result") or "").strip() + "\n\n---\n" + "\n\n".join(
+            "（後來的補充）" + n for n in notes)
+    return r
 
 
 def main():
     log, public_md, private_txt = sys.argv[1:4]
     report_md = sys.argv[4] if len(sys.argv) > 4 else None
-    r = last_result(log)
+    r = combine(read_results(log))
     env = os.environ.get
     status = r.get("subtype", "no result (crashed or timed out)")
     if r.get("is_error") and status == "success":
