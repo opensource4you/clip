@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Send a Specula run result to the person who triggered it, as a Slack DM.
 
-Usage: slack_dm.py <github-login> <message-file> [<attachment>]
+Usage: slack_dm.py <github-login> <message-file> [<attachment> ...]
 
 Env:
   SLACK_BOT_TOKEN      bot token (xoxb-...) with chat:write, files:write, im:write
@@ -52,7 +52,7 @@ def main():
         return
 
     login, message_file = sys.argv[1], sys.argv[2]
-    attachment = sys.argv[3] if len(sys.argv) > 3 else None
+    attachments = [a for a in sys.argv[3:] if os.path.exists(a)]
     user = slack_user(login)
     if not user:
         sys.exit(2)
@@ -62,25 +62,29 @@ def main():
 
     channel = call("conversations.open", token, {"users": user})["channel"]["id"]
 
-    if not attachment or not os.path.exists(attachment):
+    if not attachments:
         call("chat.postMessage", token, {"channel": channel, "text": text})
         print("sent message without attachment")
         return
 
-    size = os.path.getsize(attachment)
-    name = os.path.basename(attachment)
-    up = call("files.getUploadURLExternal", token,
-              {"filename": name, "length": size}, as_json=False)
-    with open(attachment, "rb") as f:
-        req = urllib.request.Request(up["upload_url"], data=f.read(),
-                                     headers={"Content-Type": "application/octet-stream"})
-        urllib.request.urlopen(req, timeout=300).read()
+    files = []
+    for path in attachments:
+        size = os.path.getsize(path)
+        name = os.path.basename(path)
+        up = call("files.getUploadURLExternal", token,
+                  {"filename": name, "length": size}, as_json=False)
+        with open(path, "rb") as f:
+            req = urllib.request.Request(up["upload_url"], data=f.read(),
+                                         headers={"Content-Type": "application/octet-stream"})
+            urllib.request.urlopen(req, timeout=300).read()
+        files.append({"id": up["file_id"], "title": name})
+        print(f"uploaded {name} ({size} bytes)")
     call("files.completeUploadExternal", token, {
-        "files": [{"id": up["file_id"], "title": name}],
+        "files": files,
         "channel_id": channel,
         "initial_comment": text,
     })
-    print(f"sent message with {name} ({size} bytes)")
+    print(f"sent message with {len(files)} file(s)")
 
 
 if __name__ == "__main__":

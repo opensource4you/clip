@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarize one Specula phase from Claude Code's stream-json log.
 
-Usage: run_summary.py <claude-log.jsonl> <public-summary.md> <private-message.txt>
+Usage: run_summary.py <claude-log.jsonl> <public-summary.md> <private-message.txt> [<report.md>]
 
 The public summary goes to $GITHUB_STEP_SUMMARY, which anyone logged in can read,
 so it carries only status, turns, cost and duration. Claude's final report,
@@ -10,7 +10,17 @@ Env: TARGET, PHASE, MODEL, RUN_URL, ACTOR
 """
 import json
 import os
+import re
 import sys
+
+LIMIT = 3000
+
+
+def slack_mrkdwn(text):
+    """Claude writes Markdown; Slack wants *bold* and has no headings."""
+    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
+    text = re.sub(r"^#{1,6}\s+(.+)$", r"*\1*", text, flags=re.M)
+    return text
 
 
 def last_result(path):
@@ -34,6 +44,7 @@ def last_result(path):
 
 def main():
     log, public_md, private_txt = sys.argv[1:4]
+    report_md = sys.argv[4] if len(sys.argv) > 4 else None
     r = last_result(log)
     env = os.environ.get
     status = r.get("subtype", "no result (crashed or timed out)")
@@ -52,10 +63,16 @@ def main():
         f.write(f"- 結果已用 Slack 私訊給 @{env('ACTOR')}，這裡不顯示內容\n")
 
     report = (r.get("result") or "(Claude 沒有留下最後報告，詳見附件裡的 log)").strip()
+    if report_md:
+        with open(report_md, "w", encoding="utf-8") as f:
+            f.write(report + "\n")
+    short = slack_mrkdwn(report)
+    if len(short) > LIMIT:
+        short = short[:LIMIT].rsplit("\n", 1)[0] + "\n\n…（太長，完整報告見附件的 report）"
     with open(private_txt, "w", encoding="utf-8") as f:
         f.write(f"*Specula* `{env('TARGET')}` / `{env('PHASE')}`: *{status}*\n")
         f.write(f"turns {turns}, cost {cost}, {minutes}\n{env('RUN_URL')}\n\n")
-        f.write(report[:3000])
+        f.write(short)
 
     # Fail the job when Claude did not finish the phase cleanly.
     sys.exit(0 if status == "success" else 1)
