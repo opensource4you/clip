@@ -2,11 +2,18 @@
 """Summarize one Specula phase from Claude Code's stream-json log.
 
 Usage: run_summary.py <claude-log.jsonl> <public-summary.md> <private-message.txt> [<report.md>]
+       run_summary.py --status <claude-log.jsonl>
+
+--status prints "status<TAB>turns<TAB>cost<TAB>minutes" for one phase and exits 0 only
+when the phase succeeded. The workflow uses it to decide whether to run the next phase
+and appends the line to CHAIN_FILE.
 
 The public summary goes to $GITHUB_STEP_SUMMARY, which anyone logged in can read,
 so it carries only status, turns, cost and duration. Claude's final report,
 which may describe a bug, goes only into the private Slack message.
-Env: TARGET, PHASE, MODEL, RUN_URL, ACTOR
+Env: TARGET, PHASE, MODEL, RUN_URL, ACTOR, and optionally
+  CHAIN_FILE: one "phase<TAB>status<TAB>turns<TAB>cost<TAB>minutes" line per phase of a chained run
+  STOP_FILE:  why the workflow stopped early (for example a phase that wrote no output)
 """
 import json
 import os
@@ -84,23 +91,71 @@ def combine(results):
     return r
 
 
-def main():
-    log, public_md, private_txt = sys.argv[1:4]
-    report_md = sys.argv[4] if len(sys.argv) > 4 else None
+def phase_stats(log):
+    """(result, status, turns, cost in USD or None, minutes) of one phase."""
     r = combine(read_results(log))
-    env = os.environ.get
     status = r.get("subtype", "no result (crashed or timed out)")
     if r.get("is_error") and status == "success":
         status = "error"
-    turns = r.get("num_turns", "?")
     cost = r.get("total_cost_usd")
-    cost = f"${cost:.2f}" if isinstance(cost, (int, float)) else "?"
-    minutes = run_minutes(log, r)
+    cost = cost if isinstance(cost, (int, float)) else None
+    return r, status, r.get("num_turns", "?"), cost, run_minutes(log, r)
+
+
+def fmt_cost(cost):
+    return f"${cost:.2f}" if cost is not None else "?"
+
+
+def read_chain():
+    """Rows of CHAIN_FILE, or [] when this run had a single phase."""
+    path = os.environ.get("CHAIN_FILE")
+    rows = []
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) == 5:
+                    rows.append(parts)
+    except (OSError, TypeError):
+        pass
+    return rows if len(rows) > 1 else []
+
+
+def chain_lines(rows):
+    """One line per phase plus the total. Status, turns, cost and time only, so it is safe in public."""
+    lines = [f"- {p}: {s}, turns {t}, {fmt_cost(float(c)) if c else '?'}, {m}" for p, s, t, c, m in rows]
+    total = sum(float(c) for _, _, _, c, _ in rows if c)
+    lines.append(f"- total: ${total:.2f}")
+    return lines
+
+
+def main():
+    if sys.argv[1:2] == ["--status"]:
+        _, status, turns, cost, minutes = phase_stats(sys.argv[2])
+        print(f"{status}\t{turns}\t{'' if cost is None else f'{cost:.4f}'}\t{minutes}")
+        sys.exit(0 if status == "success" else 1)
+
+    log, public_md, private_txt = sys.argv[1:4]
+    report_md = sys.argv[4] if len(sys.argv) > 4 else None
+    r, status, turns, cost, minutes = phase_stats(log)
+    cost = fmt_cost(cost)
+    env = os.environ.get
+    chain = read_chain()
+    stop = ""
+    try:
+        with open(env("STOP_FILE") or "") as f:
+            stop = f.read().strip()
+    except OSError:
+        pass
 
     with open(public_md, "w", encoding="utf-8") as f:
         f.write(f"## specula: `{env('TARGET')}` / `{env('PHASE')}`\n")
         f.write(f"- model: `{env('MODEL')}`\n")
         f.write(f"- status: **{status}**, turns: {turns}, cost: {cost}, duration: {minutes}\n")
+        if stop:
+            f.write(f"- **stopped**: {stop}\n")
+        if chain:
+            f.write("- phases:\n" + "\n".join("  " + x for x in chain_lines(chain)) + "\n")
         f.write(f"- 結果已用 Slack 私訊給 @{env('ACTOR')}，這裡不顯示內容\n")
 
     report = (r.get("result") or "(Claude 沒有留下最後報告，詳見附件裡的 log)").strip()
@@ -113,10 +168,14 @@ def main():
     with open(private_txt, "w", encoding="utf-8") as f:
         f.write(f"*Specula* `{env('TARGET')}` / `{env('PHASE')}`: *{status}*\n")
         f.write(f"turns {turns}, cost {cost}, {minutes}\n{env('RUN_URL')}\n\n")
+        if stop:
+            f.write(f"*停下來了*：{stop}\n\n")
+        if chain:
+            f.write("這次依序跑了：\n" + "\n".join(chain_lines(chain)) + "\n\n")
         f.write(short)
 
     # Fail the job when Claude did not finish the phase cleanly.
-    sys.exit(0 if status == "success" else 1)
+    sys.exit(0 if status == "success" and not stop else 1)
 
 
 if __name__ == "__main__":

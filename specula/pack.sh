@@ -9,7 +9,8 @@ out="$WORK/.specula-output"
 case "$REPORT_PHASE" in
   code-analysis)       want="modeling-brief.md" ;;
   validation-workflow) want="spec/bug-report.md" ;;
-  bug-confirmation)    want="confirmed-bugs.md bug-severity.md summary.md" ;;
+  bug-confirmation)    want="confirmed-bugs.md" ;;
+  bug-classification)  want="confirmed-bugs.md bug-severity.md summary.md" ;;
   *)                   want="" ;;
 esac
 attach=""

@@ -1,7 +1,10 @@
 # 在社群 VM 上用 Specula（TLA+）找 Kafka 的 bug：https://github.com/chia7712/Specula/tree/kafka
 # 觸發：Actions -> specula -> Run workflow（只有對 clip 有 write 權限、且列在 SPECULA_SLACK_USERS 的人才收得到結果）。
-# 一次跑一個 phase，照順序：code-analysis -> spec-generation -> harness-generation
-#   -> validation-workflow -> bug-confirmation。每個 phase 跑完先看結果再跑下一個。
+# phase 的順序：code-analysis -> spec-generation -> harness-generation -> validation-workflow
+#   -> bug-confirmation -> bug-classification。
+# 平常只跑兩次：先跑 code-analysis，看完 modeling-brief.md 覺得值得做，再選 rest 把後面的 phase 依序跑完
+# （每個 phase 是一次獨立的 Claude session；任何一個沒成功或沒寫出該有的檔案就停下來，不往下跑）。
+# 單一 phase 的選項留著，用來從中間重跑。
 # 每個 target 的工作目錄留在 VM 的 ~/specula-work/<target>，下一個 phase 接著用。
 # 結果沒送到（例如 Slack member ID 設錯）時，用 specula-resend 重送，不用重跑。
 #
@@ -9,7 +12,8 @@
 #   - Claude 的所有輸出都寫進 VM 上的檔案，不印到 log
 #   - 結果只用 Slack 私訊給觸發的人：Claude 的報告，加上這個 phase 需要人看的檔案
 #     （code-analysis：modeling-brief.md；validation-workflow：bug-report.md；
-#     bug-confirmation：confirmed-bugs.md 等）。勾 full_results 才附整個 specula-output 的 tar.gz
+#     bug-confirmation、bug-classification：confirmed-bugs.md 等）。勾 full_results 才附整個 specula-output 的 tar.gz
+#   - rest 只在最後私訊一次：最後跑的 phase 的報告，加上每個 phase 的狀態和花費
 #   - 不上傳 artifact
 # Secrets（environment: specula，只有 main 能用）：
 #   ANTHROPIC_API_KEY、SLACK_BOT_TOKEN、SPECULA_SLACK_USERS（{"github 帳號": "Slack member ID"}）
@@ -31,21 +35,23 @@ on:
           - kafka-kraft-dynamic-quorum
           - kafka-share-groups
       phase:
-        description: 要跑的 phase
+        description: 要跑的 phase（rest = code-analysis 之後的全部 phase 依序跑完）
         type: choice
         options:
           - code-analysis
+          - rest
           - spec-generation
           - harness-generation
           - validation-workflow
           - bug-confirmation
+          - bug-classification
       model:
         description: Claude 模型
         type: choice
         options: [claude-opus-5-5, claude-sonnet-5-5]
         default: claude-opus-5-5
       max_turns:
-        description: 最多幾輪（防止卡在迴圈一直花錢）
+        description: 每個 phase 最多幾輪（防止卡在迴圈一直花錢）
         default: "800"
       reset:
         description: 清掉這個 target 的工作目錄，從頭開始（只在 code-analysis 時有效）
@@ -88,6 +94,12 @@ jobs:
           [[ "$TARGET" =~ ^kafka-[a-z-]+$ ]] || { echo "::error::bad target"; exit 1; }
           [[ "$PHASE" =~ ^[a-z-]+$ ]] || { echo "::error::bad phase"; exit 1; }
           [[ "$MAX_TURNS" =~ ^[0-9]+$ ]] || { echo "::error::bad max_turns"; exit 1; }
+          case "$PHASE" in
+            rest) phases="spec-generation harness-generation validation-workflow bug-confirmation bug-classification" ;;
+            *)    phases="$PHASE" ;;
+          esac
+          echo "PHASES=$phases" >> "$GITHUB_ENV"
+          echo "phases: $phases"
           echo "WORK=$HOME/specula-work/$TARGET" >> "$GITHUB_ENV"
           echo "REPORT_PHASE=$PHASE" >> "$GITHUB_ENV"
           echo "REPORT_RUN_URL=$RUN_URL" >> "$GITHUB_ENV"
@@ -115,6 +127,9 @@ jobs:
           else
             git -C "$WORK" pull -q --ff-only || echo "::warning::Specula 無法 fast-forward，沿用目前版本"
           fi
+          if [[ "$PHASE" != "code-analysis" && ! -f "$WORK/.specula-output/modeling-brief.md" ]]; then
+            echo "::error::$TARGET 沒有 modeling-brief.md，先跑 code-analysis"; exit 1
+          fi
           git -C "$WORK" log -1 --format='Specula %h %s'
           bash "$WORK/cloud/setup.sh"
 
@@ -125,8 +140,8 @@ jobs:
           fi
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # Claude 的輸出（含 build、TLC 的 log）全部進檔案，public log 只看得到 exit code
-      - name: Run phase
+      # Claude 的輸出（含 build、TLC 的 log）全部進檔案，public log 只看得到每個 phase 的狀態
+      - name: Run phases
         id: claude
         continue-on-error: true
         working-directory: ${{ env.WORK }}
@@ -144,13 +159,17 @@ jobs:
           workers=$(( cpus * 3 / 4 ))
           gradle_workers=$(( cpus / 2 ))
           mkdir -p .specula-output/runs
-          log=".specula-output/runs/${GITHUB_RUN_ID}-${PHASE}.jsonl"
-          echo "CLAUDE_LOG=$WORK/$log" >> "$GITHUB_ENV"
+          summary_py="$GITHUB_WORKSPACE/clip/specula/run_summary.py"
+          chain="$RUNNER_TEMP/specula-chain.tsv"
+          stop="$RUNNER_TEMP/specula-stop.txt"
+          : > "$chain"
+          rm -f "$stop"
+          { echo "CHAIN_FILE=$chain"; echo "STOP_FILE=$stop"; } >> "$GITHUB_ENV"
 
-          prompt="Read guidance/${TARGET}.md. Run /${PHASE} for this target and stop when the phase is complete. If .specula-output/ already holds results from earlier phases for this target, build on them."
           rules="This session runs unattended in a GitHub Actions job on a self-hosted VM. Nobody will answer questions: make reasonable choices, write them down in .specula-output/, and finish the phase.
           These rules override CLAUDE.md where they conflict:
           - Do not commit, push or create branches. The workflow collects .specula-output/ itself.
+          - Run only the phase you are asked for, then stop. The workflow starts the next phase in a new session.
           - The VM has ${mem_gb} GB RAM and ${cpus} CPUs. Run at most one TLC instance at a time, with -Xmx${heap}g and -workers ${workers}. Pass --max-workers=${gradle_workers} to Gradle.
           - Do not use sudo or install system packages.
           - Shell commands may run up to 3 hours. Run each TLC model check in the foreground with a timeout long enough for the run you intend (the guidance's 30 minute BFS, then simulation), instead of backgrounding it and polling."
@@ -160,22 +179,62 @@ jobs:
           printf '{"env":{"BASH_DEFAULT_TIMEOUT_MS":"%s","BASH_MAX_TIMEOUT_MS":"%s"}}\n' \
             "$BASH_DEFAULT_TIMEOUT_MS" "$BASH_MAX_TIMEOUT_MS" > "$settings"
 
+          # 每個 phase 跑完一定要寫出（或更新）的檔案；沒有就代表 phase 沒做完，不往下跑
+          output_of() {
+            case "$1" in
+              code-analysis)       echo modeling-brief.md ;;
+              spec-generation)     echo spec/MC.tla ;;
+              harness-generation)  echo harness ;;
+              validation-workflow) echo spec/bug-report.md ;;
+              bug-confirmation)    echo confirmed-bugs.md ;;
+              bug-classification)  echo bug-severity.md ;;
+            esac
+          }
+
           set +e
-          start=$(date +%s)
-          claude -p "$prompt" \
-            --settings "$settings" \
-            --append-system-prompt "$rules" \
-            --model "$MODEL" \
-            --max-turns "$MAX_TURNS" \
-            --mcp-config .mcp.json --strict-mcp-config \
-            --dangerously-skip-permissions \
-            --output-format stream-json --verbose \
-            --disallowedTools "Bash(sudo:*)" "Bash(git push:*)" \
-            > "$log" 2>&1
-          rc=$?
-          # Claude 回報的 duration 不可靠，自己記實際的開始和結束時間（resend 也會讀）
-          echo "$start $(date +%s)" > "${log%.jsonl}.time"
-          echo "claude exit code: $rc"
+          rc=0
+          remaining=" $PHASES "
+          for p in $PHASES; do
+            remaining=${remaining/ $p / }
+            log=".specula-output/runs/${GITHUB_RUN_ID}-${p}.jsonl"
+            # 先寫進 GITHUB_ENV：job 中途被取消或 timeout 時，後面的 step 也知道要回報哪個 phase
+            { echo "CLAUDE_LOG=$WORK/$log"; echo "REPORT_PHASE=$p"; } >> "$GITHUB_ENV"
+            prompt="Read guidance/${TARGET}.md. Run /${p} for this target and stop when the phase is complete. If .specula-output/ already holds results from earlier phases for this target, build on them."
+            stamp="$RUNNER_TEMP/specula-${p}.start"
+            touch "$stamp"
+            start=$(date +%s)
+            claude -p "$prompt" \
+              --settings "$settings" \
+              --append-system-prompt "$rules" \
+              --model "$MODEL" \
+              --max-turns "$MAX_TURNS" \
+              --mcp-config .mcp.json --strict-mcp-config \
+              --dangerously-skip-permissions \
+              --output-format stream-json --verbose \
+              --disallowedTools "Bash(sudo:*)" "Bash(git push:*)" \
+              > "$log" 2>&1
+            claude_rc=$?
+            # Claude 回報的 duration 不可靠，自己記實際的開始和結束時間（resend 也會讀）
+            echo "$start $(date +%s)" > "${log%.jsonl}.time"
+            stats=$(python3 "$summary_py" --status "$log")
+            status_rc=$?
+            printf '%s\t%s\n' "$p" "$stats" >> "$chain"
+            echo "$p: claude exit code $claude_rc, status ${stats%%$'\t'*}"
+
+            out=$(output_of "$p")
+            if [[ $claude_rc -ne 0 || $status_rc -ne 0 ]]; then
+              reason="$p did not finish (status ${stats%%$'\t'*})"
+            elif [[ -n "$out" && -z "$(find ".specula-output/$out" -newer "$stamp" -print -quit 2>/dev/null)" ]]; then
+              reason="$p finished but did not write .specula-output/$out"
+            else
+              continue
+            fi
+            [[ -n "${remaining// /}" ]] && reason="$reason; not run:${remaining% }"
+            echo "$reason" > "$stop"
+            echo "::error::$reason"
+            rc=1
+            break
+          done
           exit $rc
 
       - name: Summary
@@ -209,7 +268,7 @@ jobs:
 
       - name: Clean up
         if: always()
-        run: rm -rf "$RUNNER_TEMP/specula-attach" "$RUNNER_TEMP"/report-*.md "$RUNNER_TEMP/message.txt"
+        run: rm -rf "$RUNNER_TEMP/specula-attach" "$RUNNER_TEMP"/report-*.md "$RUNNER_TEMP/message.txt" "$RUNNER_TEMP"/specula-*
 
       - name: Mark failed
         if: steps.claude.outcome == 'failure' || steps.summary.outcome == 'failure'

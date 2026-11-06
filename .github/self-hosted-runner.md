@@ -58,8 +58,14 @@ public 的 summary 只有狀態、輪數、花費和時間。
   `ANTHROPIC_API_KEY`、`SLACK_BOT_TOKEN`、`SPECULA_SLACK_USERS`（`{"github 帳號": "Slack member ID"}`）。
   `SPECULA_SLACK_USERS` 也是名單：不在裡面的人觸發，或 member ID 開不了私訊，job 一開始就失敗，不會花錢。
 - 結果沒送到（例如 member ID 設錯），修好 secret 後跑 `specula-resend`：不跑 Claude，重送這個 target 最近一次的結果。
+- 平常一個 target 跑兩次：先選 `code-analysis`，看完 `modeling-brief.md` 覺得值得做，再選 `rest`，
+  把 spec-generation、harness-generation、validation-workflow、bug-confirmation、bug-classification 依序跑完。
+  每個 phase 是一次獨立的 Claude session（`max_turns` 是每個 phase 的上限）；任何一個沒成功、或沒寫出該有的檔案，
+  就停下來私訊是哪個 phase 停的，後面的不跑。單一 phase 的選項用來從中間重跑。
 - 私訊附 Claude 的報告和這個 phase 需要人看的檔案（code-analysis：`modeling-brief.md`；validation-workflow：`bug-report.md`；
-  bug-confirmation：`confirmed-bugs.md`、`bug-severity.md`、`summary.md`）。下一個 phase 讀的是 VM 上的工作目錄，不是這些附件。
+  bug-confirmation：`confirmed-bugs.md`；bug-classification：`confirmed-bugs.md`、`bug-severity.md`、`summary.md`）。
+  `rest` 只在最後私訊一次：最後跑的 phase 的報告和附件，加上每個 phase 的狀態和花費。
+  下一個 phase 讀的是 VM 上的工作目錄，不是這些附件。
   表單勾 `full_results` 才另外附整個 `specula-output` 的 tar.gz。
 - 每個 target 的工作目錄在 `~/specula-work/<target>`，phase 之間接著用；表單勾 `reset` 才會從頭開始。
   每次 Claude 的完整 log 在 `~/specula-work/<target>/.specula-output/runs/`。
