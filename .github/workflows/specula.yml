@@ -132,6 +132,10 @@ jobs:
         working-directory: ${{ env.WORK }}
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Claude Code 的 shell 指令預設 2 分鐘、最多 10 分鐘就被砍掉；TLC 的 BFS 一次要跑 30 分鐘以上，
+          # 被砍掉的話只會探索很淺的狀態，看起來卻像「沒找到 bug」。預設 30 分鐘，最多 3 小時
+          BASH_DEFAULT_TIMEOUT_MS: "1800000"
+          BASH_MAX_TIMEOUT_MS: "10800000"
         run: |
           claude --version
           mem_gb=$(free -g | awk '/^Mem:/{print $2}')
@@ -148,11 +152,18 @@ jobs:
           These rules override CLAUDE.md where they conflict:
           - Do not commit, push or create branches. The workflow collects .specula-output/ itself.
           - The VM has ${mem_gb} GB RAM and ${cpus} CPUs. Run at most one TLC instance at a time, with -Xmx${heap}g and -workers ${workers}. Pass --max-workers=${gradle_workers} to Gradle.
-          - Do not use sudo or install system packages."
+          - Do not use sudo or install system packages.
+          - Shell commands may run up to 3 hours. Run each TLC model check in the foreground with a timeout long enough for the run you intend (the guidance's 30 minute BFS, then simulation), instead of backgrounding it and polling."
+
+          # 只設環境變數有時不會生效，同樣的值也透過 --settings 的 env 傳一次
+          settings="$RUNNER_TEMP/claude-settings.json"
+          printf '{"env":{"BASH_DEFAULT_TIMEOUT_MS":"%s","BASH_MAX_TIMEOUT_MS":"%s"}}\n' \
+            "$BASH_DEFAULT_TIMEOUT_MS" "$BASH_MAX_TIMEOUT_MS" > "$settings"
 
           set +e
           start=$(date +%s)
           claude -p "$prompt" \
+            --settings "$settings" \
             --append-system-prompt "$rules" \
             --model "$MODEL" \
             --max-turns "$MAX_TURNS" \
