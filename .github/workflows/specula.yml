@@ -3,7 +3,7 @@
 # 一次跑一個 phase，照順序：code-analysis -> spec-generation -> harness-generation
 #   -> validation-workflow -> bug-confirmation。每個 phase 跑完先看結果再跑下一個。
 # 每個 target 的工作目錄留在 VM 的 ~/specula-work/<target>，下一個 phase 接著用。
-# phase 選 resend：不跑 Claude，把這個 target 最近一次的結果重新私訊出去（例如上次 Slack 沒送到）。
+# 結果沒送到（例如 Slack member ID 設錯）時，用 specula-resend 重送，不用重跑。
 #
 # clip 是 public repo，log 和 summary 任何人都看得到，但 Specula 找到的可能是還沒公開的漏洞，所以：
 #   - Claude 的所有輸出都寫進 VM 上的檔案，不印到 log
@@ -39,7 +39,6 @@ on:
           - harness-generation
           - validation-workflow
           - bug-confirmation
-          - resend
       model:
         description: Claude 模型
         type: choice
@@ -103,19 +102,7 @@ jobs:
           python3 clip/specula/slack_dm.py "$ACTOR" || {
             echo "::error::@$ACTOR 不在 SPECULA_SLACK_USERS，或 member ID 開不了 Slack 私訊，結果沒地方送，不跑"; exit 1; }
 
-      - name: Find last run
-        if: inputs.phase == 'resend'
-        run: |
-          last=$(ls -t "$WORK"/.specula-output/runs/*.jsonl 2>/dev/null | head -1)
-          [[ -n "$last" ]] || { echo "::error::$TARGET 還沒有任何結果"; exit 1; }
-          name=$(basename "$last" .jsonl)
-          echo "resend: run ${name%%-*}"
-          echo "CLAUDE_LOG=$last" >> "$GITHUB_ENV"
-          echo "REPORT_PHASE=${name#*-}" >> "$GITHUB_ENV"
-          echo "REPORT_RUN_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${name%%-*}" >> "$GITHUB_ENV"
-
       - name: Prepare work dir
-        if: inputs.phase != 'resend'
         run: |
           if [[ "$RESET" == "true" && "$PHASE" == "code-analysis" ]]; then
             echo "reset: removing $WORK"
@@ -132,7 +119,6 @@ jobs:
           bash "$WORK/cloud/setup.sh"
 
       - name: Install Claude Code
-        if: inputs.phase != 'resend'
         run: |
           if ! command -v claude >/dev/null && [[ ! -x "$HOME/.local/bin/claude" ]]; then
             curl -fsSL https://claude.ai/install.sh | bash
@@ -142,7 +128,6 @@ jobs:
       # Claude 的輸出（含 build、TLC 的 log）全部進檔案，public log 只看得到 exit code
       - name: Run phase
         id: claude
-        if: inputs.phase != 'resend'
         continue-on-error: true
         working-directory: ${{ env.WORK }}
         env:
@@ -196,31 +181,7 @@ jobs:
       # 依 phase 挑出需要人看的檔案；整包 tar.gz 只在勾 full_results 時附上
       - name: Pack results
         if: always() && env.CLAUDE_LOG != ''
-        run: |
-          out="$WORK/.specula-output"
-          [[ -d "$WORK/kafka/.git" ]] && git -C "$WORK/kafka" diff > "$out/kafka-harness.patch"
-          case "$REPORT_PHASE" in
-            code-analysis)       want="modeling-brief.md" ;;
-            validation-workflow) want="spec/bug-report.md" ;;
-            bug-confirmation)    want="confirmed-bugs.md bug-severity.md summary.md" ;;
-            *)                   want="" ;;
-          esac
-          attach=""
-          for f in $want; do
-            [[ -f "$out/$f" ]] || continue
-            dst="$RUNNER_TEMP/specula-attach/${TARGET}-$(basename "$f")"
-            mkdir -p "$(dirname "$dst")" && cp "$out/$f" "$dst" && attach="$attach $dst"
-          done
-          if [[ "$FULL_RESULTS" == "true" ]]; then
-            pack="$RUNNER_TEMP/specula-attach/specula-${TARGET}-${REPORT_PHASE}-${GITHUB_RUN_ID}.tar.gz"
-            mkdir -p "$(dirname "$pack")"
-            # 解開後是一般的 specula-output/，不是隱藏的 .specula-output/
-            tar -czf "$pack" -C "$WORK" --transform 's,^\.specula-output,specula-output,' .specula-output
-            attach="$attach $pack"
-          fi
-          echo "ATTACH=$attach" >> "$GITHUB_ENV"
-          echo "PACKED=true" >> "$GITHUB_ENV"
-          ls -la "$RUNNER_TEMP/specula-attach" 2>/dev/null || echo "no extra files for $REPORT_PHASE"
+        run: bash clip/specula/pack.sh
 
       - name: Send to Slack
         if: always() && env.PACKED == 'true'
@@ -237,5 +198,5 @@ jobs:
         run: rm -rf "$RUNNER_TEMP/specula-attach" "$RUNNER_TEMP"/report-*.md "$RUNNER_TEMP/message.txt"
 
       - name: Mark failed
-        if: steps.claude.outcome == 'failure' || (inputs.phase != 'resend' && steps.summary.outcome == 'failure')
+        if: steps.claude.outcome == 'failure' || steps.summary.outcome == 'failure'
         run: exit 1

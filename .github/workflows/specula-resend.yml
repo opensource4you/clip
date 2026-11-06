@@ -1,0 +1,99 @@
+# 不跑 Claude，把某個 target 最近一次的 specula 結果重新私訊給觸發的人
+# （例如上次 Slack member ID 設錯沒送到）。結果在 specula runner 的 ~/specula-work/<target>。
+# 不花 API 費用；specula 正在跑時，會排在它後面。說明見 .github/self-hosted-runner.md
+
+name: specula-resend
+run-name: "specula-resend ${{ inputs.target }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 重送哪個 target 最近一次的結果
+        type: choice
+        options:
+          - kafka-consumer-group-rebalance
+          - kafka-log-cleaner
+          - kafka-transaction-coordinator
+          - kafka-kraft-dynamic-quorum
+          - kafka-share-groups
+      full_results:
+        description: 另外附上整個 specula-output 的 tar.gz（平常只附需要人看的檔案）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: specula-resend
+  cancel-in-progress: false
+
+jobs:
+  resend:
+    runs-on: [self-hosted, linux, specula]
+    environment: specula
+    timeout-minutes: 15
+    env:
+      TARGET: ${{ inputs.target }}
+      FULL_RESULTS: ${{ inputs.full_results }}
+      MODEL: "-"
+      ACTOR: ${{ github.triggering_actor }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: clip
+          sparse-checkout: specula
+
+      - name: Check recipient
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SPECULA_SLACK_USERS: ${{ secrets.SPECULA_SLACK_USERS }}
+        run: |
+          python3 clip/specula/slack_dm.py "$ACTOR" || {
+            echo "::error::@$ACTOR 不在 SPECULA_SLACK_USERS，或 member ID 開不了 Slack 私訊"; exit 1; }
+
+      - name: Find last run
+        run: |
+          [[ "$TARGET" =~ ^kafka-[a-z-]+$ ]] || { echo "::error::bad target"; exit 1; }
+          WORK="$HOME/specula-work/$TARGET"
+          last=$(ls -t "$WORK"/.specula-output/runs/*.jsonl 2>/dev/null | head -1)
+          [[ -n "$last" ]] || { echo "::error::$TARGET 還沒有任何結果"; exit 1; }
+          name=$(basename "$last" .jsonl)
+          echo "resend: run ${name%%-*}, phase ${name#*-}"
+          {
+            echo "WORK=$WORK"
+            echo "CLAUDE_LOG=$last"
+            echo "REPORT_PHASE=${name#*-}"
+            echo "REPORT_RUN_URL=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/${name%%-*}"
+          } >> "$GITHUB_ENV"
+
+      # 舊那一輪失敗的話 run_summary 會回非零，這裡只是重送，不讓 job 因此失敗
+      - name: Summary
+        continue-on-error: true
+        env:
+          PHASE: ${{ env.REPORT_PHASE }}
+          RUN_URL: ${{ env.REPORT_RUN_URL }}
+        run: |
+          rc=0
+          python3 clip/specula/run_summary.py "$CLAUDE_LOG" summary.md "$RUNNER_TEMP/message.txt" \
+            "$RUNNER_TEMP/report-${TARGET}-${REPORT_PHASE}.md" || rc=$?
+          sed -i 's/^## specula:/## specula-resend:/' summary.md
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
+
+      - name: Pack results
+        run: bash clip/specula/pack.sh
+
+      - name: Send to Slack
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SPECULA_SLACK_USERS: ${{ secrets.SPECULA_SLACK_USERS }}
+        run: |
+          # shellcheck disable=SC2086
+          python3 clip/specula/slack_dm.py "$ACTOR" "$RUNNER_TEMP/message.txt" \
+            "$RUNNER_TEMP/report-${TARGET}-${REPORT_PHASE}.md" $ATTACH
+
+      - name: Clean up
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/specula-attach" "$RUNNER_TEMP"/report-*.md "$RUNNER_TEMP/message.txt"

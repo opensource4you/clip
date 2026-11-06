@@ -7,7 +7,7 @@
 | kafka-loop | `kafka`          | 多個           | 一個 runner 跑一個容器，要平行幾個就註冊幾個 |
 | kafka-full | `kafka-full`     | **一個**       | 完整跑一次 JUnit，Gradle 自己平行，吃滿整台機器 |
 | kafka-e2e  | `kafka-e2e`      | **一個**       | e2e 會吃滿整台機器，同時只能跑一個 |
-| specula    | `specula`        | **一個**       | Specula（TLA+）跑 Kafka，TLC 吃滿整台機器，一跑可能一兩天；用專屬的機器 |
+| specula    | `specula`        | **一個**       | Specula（TLA+）跑 Kafka，TLC 吃滿整台機器，一跑可能一兩天；用專屬的機器。`specula-resend` 也用這台 |
 
 一個 runner 同時只跑一個 job，所以「一台機器同時跑幾個 job」由那台註冊幾個 runner 決定。
 要吃滿整台機器的 workflow（full、e2e）只能排在「只註冊一個 runner」的機器上，
@@ -55,7 +55,7 @@ public 的 summary 只有狀態、輪數、花費和時間。
 - Secrets 放在 environment `specula`（只有 `main` 能用）：
   `ANTHROPIC_API_KEY`、`SLACK_BOT_TOKEN`、`SPECULA_SLACK_USERS`（`{"github 帳號": "Slack member ID"}`）。
   `SPECULA_SLACK_USERS` 也是名單：不在裡面的人觸發，或 member ID 開不了私訊，job 一開始就失敗，不會花錢。
-- 結果沒送到（例如 member ID 設錯），修好 secret 後 phase 選 `resend`：不跑 Claude，重送這個 target 最近一次的結果。
+- 結果沒送到（例如 member ID 設錯），修好 secret 後跑 `specula-resend`：不跑 Claude，重送這個 target 最近一次的結果。
 - 私訊附 Claude 的報告和這個 phase 需要人看的檔案（code-analysis：`modeling-brief.md`；validation-workflow：`bug-report.md`；
   bug-confirmation：`confirmed-bugs.md`、`bug-severity.md`、`summary.md`）。下一個 phase 讀的是 VM 上的工作目錄，不是這些附件。
   表單勾 `full_results` 才另外附整個 `specula-output` 的 tar.gz。
