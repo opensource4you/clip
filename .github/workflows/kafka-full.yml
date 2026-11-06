@@ -52,6 +52,8 @@ jobs:
       FLAKY: ${{ inputs.flaky }}
       IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
       GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/full-${{ inputs.jdk }}
+      # 每個 runner 一次只跑一個 job，用 runner 名稱當 container 名字，清掉的只會是這個 runner 自己留下的
+      CONTAINER: kafka-full-${{ runner.name }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -114,11 +116,14 @@ jobs:
           export EXTRA
           mkdir -p "$GRADLE_CACHE_DIR"
           podman pull -q "$IMAGE"
+          # job 被取消時 runner 只殺掉 podman 這個 client，container 會繼續跑、一直佔著 Gradle cache 的鎖，
+          # 下一次就會 "Timeout waiting to lock journal cache"。所以 container 取固定名字，跑之前先清掉上次留下的
+          podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
           # podman 預設每個容器最多 2048 個 process/thread，Gradle 加上多個測試 fork 會超過，
           # 出現 pthread_create failed (EAGAIN)，所以把上限拿掉（跟 kafka/test_kafka.sh 一樣）
           # 用一般使用者跑，不要用 root：root 可以無視檔案權限，會讓改權限再看會不會失敗的測試誤判。
           # --userns=keep-id 讓容器裡的使用者跟 host 上的 runner 同一個 uid，掛進去的目錄才寫得了。
-          podman run --rm --pids-limit=-1 --ulimit nproc=16384:16384 --ulimit nofile=65536:65536 \
+          podman run --rm --name "$CONTAINER" --pids-limit=-1 --ulimit nproc=16384:16384 --ulimit nofile=65536:65536 \
             --userns=keep-id -e HOME=/tmp -e GRADLE_USER_HOME=/gradle-home \
             -e TASKS -e RETRIES -e FORKS -e EXTRA \
             -v "$PWD/kafka:/tmp/kafka:z" \
@@ -130,6 +135,10 @@ jobs:
                 -PmaxTestRetries="$RETRIES" -PmaxTestRetryFailures=10 \
                 -x spotbugsMain -x spotbugsTest \
                 "${extra[@]}" "${tasks[@]}"' 2>&1 | tee out/gradle.log
+
+      - name: Stop container
+        if: always()
+        run: podman rm -f "$CONTAINER" >/dev/null 2>&1 || true
 
       - name: Summary
         if: always()
