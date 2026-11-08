@@ -7,11 +7,17 @@
 #   Nothing in the bundle is truncated.
 #
 # Usage:
-#   pr-review.sh <pr-number> [base-branch]      # base-branch defaults to trunk
+#   pr-review.sh <pr-url> [base-branch]         # any GitHub repo, e.g.
+#                                               #   pr-review.sh https://github.com/apache/kafka-site/pull/876
+#   pr-review.sh <pr-number> [base-branch]      # apache/kafka (legacy form)
+#
+# base-branch defaults to the PR's own base branch (via `gh`), falling back to
+# the repo's default branch (via `git ls-remote`).
 #
 # Env overrides:
-#   REPO_DIR      default $HOME/project/kafka (local clone to operate on)
-#   UPSTREAM      default https://github.com/apache/kafka
+#   REPO_DIR      local clone to operate on; default $HOME/project/<repo-name>,
+#                 cloned automatically if missing
+#   UPSTREAM      repo URL; derived from <pr-url>, default https://github.com/apache/kafka
 #   OUT_DIR       default $HOME/pr-review
 #   GITHUB_TOKEN  optional; falls back to `gh auth token`. Without a token the
 #                 GitHub API allows 60 requests/hour, which is enough for a few PRs.
@@ -23,25 +29,57 @@
 
 set -euo pipefail
 
-PR_NUMBER="${1:?usage: $(basename "$0") <pr-number> [base-branch]}"
-MAIN="${2:-${MAIN:-trunk}}"
-UPSTREAM="${UPSTREAM:-https://github.com/apache/kafka}"
+ARG="${1:?usage: $(basename "$0") <pr-url|pr-number> [base-branch]}"
 OUT_DIR="${OUT_DIR:-$HOME/pr-review}"
 
+# ---- Resolve repo + PR number from the argument -----------------------------
+if [[ "$ARG" =~ ^https?://github\.com/([^/]+)/([^/]+)/pull/([0-9]+) ]]; then
+  UPSTREAM="https://github.com/${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+  PR_NUMBER="${BASH_REMATCH[3]}"
+elif [[ "$ARG" =~ ^[0-9]+$ ]]; then
+  UPSTREAM="${UPSTREAM:-https://github.com/apache/kafka}"
+  PR_NUMBER="$ARG"
+else
+  echo "ERROR: expected a GitHub PR URL or a PR number, got: $ARG" >&2
+  exit 2
+fi
+
 REPO_SLUG="$(printf '%s' "$UPSTREAM" | sed -E 's#^(https://github\.com/|git@github\.com:)##; s#\.git$##; s#/$##')"
+REPO_NAME="${REPO_SLUG##*/}"
+REPO_DIR="${REPO_DIR:-$HOME/project/$REPO_NAME}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-$(gh auth token 2>/dev/null || true)}"
 export GITHUB_TOKEN
 
-cd "${REPO_DIR:-$HOME/project/kafka}"
+# ---- Resolve base branch: explicit arg > PR's base > repo default -----------
+MAIN="${2:-${MAIN:-}}"
+if [ -z "$MAIN" ] && command -v gh >/dev/null 2>&1; then
+  MAIN="$(gh api "repos/$REPO_SLUG/pulls/$PR_NUMBER" --jq .base.ref 2>/dev/null || true)"
+fi
+if [ -z "$MAIN" ]; then
+  MAIN="$(git ls-remote --symref "$UPSTREAM" HEAD 2>/dev/null \
+          | sed -nE 's#^ref: refs/heads/([^[:space:]]+)[[:space:]]+HEAD$#\1#p')"
+fi
+if [ -z "$MAIN" ]; then
+  echo "ERROR: could not determine base branch for $REPO_SLUG; pass it as the 2nd argument" >&2
+  exit 1
+fi
+
+echo "==> Repo $REPO_SLUG, PR #$PR_NUMBER, base branch $MAIN"
+
+if [ ! -d "$REPO_DIR/.git" ]; then
+  echo "==> Cloning $UPSTREAM into $REPO_DIR"
+  git clone -q "$UPSTREAM" "$REPO_DIR"
+fi
+cd "$REPO_DIR"
 
 echo "==> Resetting working tree"
 git reset -q --hard
 git clean -fdq
 
 echo "==> Syncing $MAIN with $UPSTREAM"
-git switch -q "$MAIN"
 git fetch -q "$UPSTREAM" "$MAIN"
-git reset -q --hard FETCH_HEAD
+# -C creates the branch if the clone has never checked it out (e.g. a release branch).
+git switch -q -C "$MAIN" FETCH_HEAD
 
 echo "==> Fetching PR #$PR_NUMBER"
 git branch -D "$PR_NUMBER" >/dev/null 2>&1 || true
@@ -183,7 +221,7 @@ PY
 
 # ---- Write bundle ----------------------------------------------------------
 mkdir -p "$OUT_DIR"
-BUNDLE="$OUT_DIR/pr-$PR_NUMBER.md"
+BUNDLE="$OUT_DIR/$REPO_NAME-pr-$PR_NUMBER.md"
 
 lang_of() {
   case "${1##*.}" in
@@ -193,10 +231,16 @@ lang_of() {
     kt|kts) echo kotlin ;;
     gradle|groovy) echo groovy ;;
     sh|bash) echo bash ;;
+    go) echo go ;;
+    rs) echo rust ;;
+    js|mjs) echo javascript ;;
+    ts|tsx) echo typescript ;;
+    css|scss) echo css ;;
     md) echo markdown ;;
     json) echo json ;;
     yml|yaml) echo yaml ;;
-    xml|html) echo xml ;;
+    xml) echo xml ;;
+    html|htm) echo html ;;
     properties|conf|cfg) echo properties ;;
     *) echo text ;;
   esac
