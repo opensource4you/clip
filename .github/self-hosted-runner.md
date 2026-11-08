@@ -11,7 +11,7 @@
 
 一個 runner 同時只跑一個 job，所以「一台機器同時跑幾個 job」由那台註冊幾個 runner 決定。
 job 被取消時 runner 只會殺掉 podman 這個 client，container 會繼續跑、佔著 Gradle cache 的鎖。
-kafka-full、kafka-loop 在跑之前和結束時，都會用 `kafka/remove_cache_containers.sh` 清掉掛著同一個 cache 的 container。
+kafka-full、kafka-loop 在跑之前和結束時，都會用 `kafka/ci/remove_cache_containers.sh` 清掉掛著同一個 cache 的 container。
 要吃滿整台機器的 workflow（full、e2e）只能排在「只註冊一個 runner」的機器上，
 目前做法是 e2e 機器的 runner 同時帶 `kafka-e2e` 和 `kafka-full` 兩個 label：
 同一台一次只會跑其中一個，也不會被 loop 擠到。

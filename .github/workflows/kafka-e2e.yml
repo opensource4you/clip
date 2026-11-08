@@ -1,4 +1,4 @@
-# 取代 kafka/kafka_e2e.pipeline：在社群 VM（self-hosted runner）上跑 Kafka ducktape 系統測試。
+# 取代原本 Jenkins 的 kafka_e2e pipeline：在社群 VM（self-hosted runner）上跑 Kafka ducktape 系統測試。
 # 觸發：Actions -> kafka-e2e -> Run workflow（只有對 clip 有 write 權限的人能按）。
 # 一個 runner 同時只跑一個 job，等同原本的 throttle(kafka_one_per_node)。
 # Runner 設定見 .github/self-hosted-runner.md
@@ -102,7 +102,7 @@ jobs:
             echo "- result: **${{ steps.tests.outcome }}**"
             echo
             # 統計和失敗/flaky 的測試；完整報告在 artifact
-            python3 ../clip/kafka/ducktape_summary.py results ../e2e.log
+            python3 ../clip/kafka/ci/ducktape_summary.py results ../e2e.log
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Archive results

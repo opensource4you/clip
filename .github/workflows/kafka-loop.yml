@@ -1,4 +1,4 @@
-# 取代 kafka/kafka_loop.pipeline：反覆跑 Kafka 測試，抓 flaky。
+# 取代原本 Jenkins 的 kafka_loop pipeline：反覆跑 Kafka 測試，抓 flaky。
 # 可以選在 GitHub 的機器（免費、平行數多、每個 job 最多 6 小時）或社群 VM（self-hosted runner）上跑。
 # 觸發：Actions -> kafka-loop -> Run workflow（只有對 clip 有 write 權限的人能按）。
 # 結果：run 頁面公開可看；最下面的 report job 會彙整每個失敗測試的次數和重跑指令。
@@ -63,7 +63,7 @@ jobs:
           sparse-checkout: kafka
       - name: Validate inputs
         run: |
-          bash kafka/check_gradle_command.sh "$COMMAND"
+          bash kafka/ci/check_gradle_command.sh "$COMMAND"
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
@@ -142,13 +142,13 @@ jobs:
           "$CR" rm -f "$CONTAINER" >/dev/null 2>&1 || true
           # 舊版 workflow 留下的 container 沒有名字，用「掛了同一個 Gradle cache」來找；
           # 每個 runner 的 cache 目錄不同，不會動到同一台機器上其他 runner 的 container
-          bash clip/kafka/remove_cache_containers.sh "$CR" "$GRADLE_CACHE_DIR"
+          bash clip/kafka/ci/remove_cache_containers.sh "$CR" "$GRADLE_CACHE_DIR"
           : > out/failures.txt
           failed=0
           for i in $(seq 1 "$LOOPS"); do
             echo "::group::run $i/$LOOPS"
             # podman 預設每個容器最多 2048 個 process/thread，Gradle 加上多個測試 fork 會超過，
-            # 出現 pthread_create failed (EAGAIN)，所以把上限拿掉（跟 kafka/test_kafka.sh 一樣）
+            # 出現 pthread_create failed (EAGAIN)，所以把上限拿掉（跟 kafka/local/test_kafka.sh 一樣）
             # run step 預設是 bash -e，失敗時要用 || 接住，不然第一輪失敗整個 loop 就結束了
             rc=0
             # shellcheck disable=SC2086  # USEROPT may be two words
@@ -160,7 +160,7 @@ jobs:
               "$IMAGE" \
               bash -c 'set -f; read -ra cmd <<< "$COMMAND"; cd /tmp/kafka && chmod +x ./gradlew && "${cmd[@]}"' || rc=$?
             echo "::endgroup::"
-            python3 clip/kafka/junit_failures.py kafka | sed "s/^/$i /" >> out/failures.txt \
+            python3 clip/kafka/ci/junit_failures.py kafka | sed "s/^/$i /" >> out/failures.txt \
               || echo "::warning::c${{ matrix.id }} run $i: junit_failures.py failed"
             if [ "$rc" -ne 0 ]; then
               failed=$((failed + 1))
@@ -179,7 +179,7 @@ jobs:
         run: |
           CR=$(command -v podman || command -v docker)
           [ -z "${CONTAINER:-}" ] || "$CR" rm -f "$CONTAINER" >/dev/null 2>&1 || true
-          bash clip/kafka/remove_cache_containers.sh "$CR" "$GRADLE_CACHE_DIR"
+          bash clip/kafka/ci/remove_cache_containers.sh "$CR" "$GRADLE_CACHE_DIR"
 
       - name: Upload summary data
         if: always()
