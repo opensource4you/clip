@@ -2,6 +2,7 @@
 # 一次性設定：repo Settings -> Pages -> Source 選 "GitHub Actions"。
 #   https://opensource4you.github.io/clip/             open PRs
 #   https://opensource4you.github.io/clip/merged.html  最近 30 天 merged
+#   https://opensource4you.github.io/clip/reviews.html 最近 30 天 review 過別人的 PR
 
 name: community-prs
 
@@ -40,12 +41,16 @@ jobs:
       - name: Build pages
         run: |
           mkdir -p site
-          NAV=(--nav "open=index.html" --nav "merged 30d=merged.html")
+          SINCE="$(date -u -d '30 days ago' +%F)"
+          NAV=(--nav "open=index.html" --nav "merged 30d=merged.html" --nav "reviews 30d=reviews.html")
           python3 community_prs.py --people-file people_all.json --no-cache "${NAV[@]}" \
             --out site/index.html
           python3 community_prs.py --people-file people_all.json --no-cache "${NAV[@]}" \
-            --state merged --since "$(date -u -d '30 days ago' +%F)" \
+            --state merged --since "$SINCE" \
             --out site/merged.html
+          python3 community_prs.py --people-file people_all.json --no-cache "${NAV[@]}" \
+            --role reviewer --state any --since "$SINCE" \
+            --out site/reviews.html
 
       - uses: actions/upload-pages-artifact@v5
         with:

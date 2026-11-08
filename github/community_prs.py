@@ -10,10 +10,15 @@ Usage:
   python3 community_prs.py --people-file people_all.json --state merged --since 2026-10-01
   python3 community_prs.py --people-file people_all.json --max-age 60   # reuse results < 60 min old
   python3 community_prs.py --people brandboat,m1a2st --out prs.html
+  python3 community_prs.py --people-file people_all.json --role reviewer --state any --since 2026-10-01
 
 The generated page has a repo dropdown, so one fetch covers every project.
 For open PRs it also shows who the PR is waiting on (reviewer / merge / author)
 and for how long, worked out from recent commits, reviews and comments.
+
+--role reviewer lists the PRs each person reviewed (submitted a review on) instead
+of the ones they wrote, with their own verdict and review count. Plain conversation
+comments without a review don't count. --since then means "reviewed on or after".
 
 people file: {"users": [...], "repos": [...]}; a plain list of logins also works.
 Auth: uses whatever `gh auth login` set up; no separate token needed.
@@ -87,22 +92,26 @@ def owner_scope(repos):
     return scope if len(scope) <= 180 else ""
 
 
-def search_string(author, state, since, scope=""):
-    q = f"{scope} is:pr author:{author}".strip()
-    if state == "open":
-        q += " is:open"
-    elif state == "merged":
-        q += " is:merged"
-        if since:
+def search_string(login, state, since, scope="", role="author"):
+    who = f"reviewed-by:{login}" if role == "reviewer" else f"author:{login}"
+    q = f"{scope} is:pr {who}".strip()
+    if state != "any":
+        q += f" is:{state}"
+    if since:
+        if role == "reviewer" or state in ("open", "any"):
+            # submitting a review bumps updatedAt, so this keeps every PR reviewed since then;
+            # the exact review time is checked client-side
+            q += f" updated:>={since}"
+        elif state == "merged":
             q += f" merged:>={since}"
-    elif state == "closed":
-        q += " is:closed"
-        if since:
+        elif state == "closed":
             q += f" closed:>={since}"
+    if len(q) > 256 and scope:   # search length cap; drop the owner scope, repos are filtered client-side anyway
+        return search_string(login, state, since, "", role)
     return q
 
 
-def build_query(authors, state, since, scope="", cursors=None):
+def build_query(authors, state, since, scope="", cursors=None, role="author"):
     # only open PRs need the timeline; it makes the query noticeably heavier
     timeline = f'''
       timelineItems(last: {TIMELINE}, itemTypes: [PULL_REQUEST_COMMIT, PULL_REQUEST_REVIEW, ISSUE_COMMENT]) {{
@@ -116,8 +125,11 @@ def build_query(authors, state, since, scope="", cursors=None):
       }}''' if state == "open" else ""
     parts = []
     for i, a in enumerate(authors):
-        q = search_string(a, state, since, scope).replace('"', '\\"')
+        q = search_string(a, state, since, scope, role).replace('"', '\\"')
         after = f', after: "{cursors[a]}"' if cursors and cursors.get(a) else ""
+        # reviewer mode: this person's own reviews on the PR (verdict, count, when)
+        mine = (f'\n      mine: reviews(author: "{a}", last: 20) {{ totalCount nodes {{ state submittedAt }} }}'
+                if role == "reviewer" else "")
         parts.append(f'''
   a{i}: search(type: ISSUE, query: "{q}", first: {PER_AUTHOR}{after}) {{
     issueCount
@@ -129,7 +141,7 @@ def build_query(authors, state, since, scope="", cursors=None):
       repository {{ nameWithOwner }}
       labels(first: 6) {{ nodes {{ name }} }}
       comments {{ totalCount }}
-      reviews(first: 1) {{ totalCount }}{timeline}
+      reviews(first: 1) {{ totalCount }}{mine}{timeline}
     }} }}
   }}''')
     return "query {" + "".join(parts) + "\n}"
@@ -153,11 +165,11 @@ def gh_graphql(query):
         return data["data"]
 
 
-def fetch_chunk(chunk, state, since, scope):
+def fetch_chunk(chunk, state, since, scope, role="author"):
     out = {login: [] for login in chunk}
     cursors, pending = {}, list(chunk)
     while pending:
-        data = gh_graphql(build_query(pending, state, since, scope, cursors))
+        data = gh_graphql(build_query(pending, state, since, scope, cursors, role))
         nxt = []
         for j, login in enumerate(pending):
             block = data[f"a{j}"]
@@ -169,13 +181,13 @@ def fetch_chunk(chunk, state, since, scope):
     return out
 
 
-def fetch(people, repos, state, since, all_repos=False):
+def fetch(people, repos, state, since, all_repos=False, role="author"):
     wanted = {r.lower() for r in repos}
     scope = "" if all_repos else owner_scope(repos)
     chunks = [people[i:i + BATCH] for i in range(0, len(people), BATCH)]
     result, done, t0 = {}, 0, time.time()
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        for out in ex.map(lambda c: fetch_chunk(c, state, since, scope), chunks):
+        for out in ex.map(lambda c: fetch_chunk(c, state, since, scope, role), chunks):
             result.update(out)
             done += len(out)
             print(f"fetched {done}/{len(people)} ({time.time() - t0:.0f}s)", file=sys.stderr)
@@ -183,7 +195,34 @@ def fetch(people, repos, state, since, all_repos=False):
         for login in result:
             result[login] = [p for p in result[login]
                              if p["repository"]["nameWithOwner"].lower() in wanted]
+    if role == "reviewer":
+        # drop their own PRs, and PRs whose reviews by them all predate --since
+        for login in result:
+            keep = []
+            for p in result[login]:
+                if ((p.get("author") or {}).get("login") or "").lower() == login.lower():
+                    continue
+                subs = submitted(p)
+                if subs and (not since or subs[-1]["submittedAt"][:10] >= since):
+                    keep.append(p)
+            result[login] = keep
     return result
+
+
+def submitted(pr):
+    """The group owner's own submitted reviews on pr, oldest first (reviewer mode)."""
+    nodes = (pr.get("mine") or {}).get("nodes") or []
+    return sorted((r for r in nodes if r and r.get("submittedAt") and r.get("state") != "PENDING"),
+                  key=lambda r: r["submittedAt"])
+
+
+def verdict(subs):
+    """A reviewer's standing verdict, the way GitHub shows it: the latest approve /
+    request-changes / dismissed wins over later plain comments."""
+    for r in reversed(subs):
+        if r["state"] in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            return r["state"]
+    return "COMMENTED" if subs else ""
 
 
 def days_ago(iso):
@@ -280,7 +319,11 @@ def dispatch_target(cli):
     return None
 
 
-def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
+VERDICT = {"APPROVED": ("✓ approved", "mv-ok"), "CHANGES_REQUESTED": ("± changes requested", "mv-cr"),
+           "COMMENTED": ("💬 commented", "mv-c"), "DISMISSED": ("dismissed", "mv-c")}
+
+
+def render(result, repos, state, since, dispatch=None, nav=None, out_name="", role="author"):
     e = html.escape
     navhtml = ""
     if nav:
@@ -299,10 +342,13 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
         repo, wf = dispatch
         refresh = (f' · <a href="https://github.com/{e(repo)}/actions/workflows/{e(wf)}" target="_blank" '
                    f'title="Run workflow there to refresh this page">&#8635; refresh via Actions</a>')
-    title = f"Community PRs ({state}{', since ' + since if since else ''})"
+    revmode = role == "reviewer"
+    title = (f"Community {'reviews' if revmode else 'PRs'} "
+             f"({'all states' if state == 'any' else state}{', since ' + since if since else ''})")
     total = sum(len(v) for v in result.values())
     stale_key = "updatedAt"
     openmode = state == "open"
+    mode = "review" if revmode else "open" if openmode else "done"
 
     def took(p):
         """days from opening to merge (or to last update for closed-unmerged)."""
@@ -311,7 +357,8 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
         b = dt.datetime.fromisoformat(end.replace("Z", "+00:00"))
         return max(0, (b - a).days)
 
-    sumcols = (f'<th data-k="nr">no review</th><th data-k="st" title="no progress for {WAIT_DAYS}+ days">idle ≥{WAIT_DAYS}d</th>' if openmode else
+    sumcols = ('<th data-k="ap" title="PRs where their standing review is an approval">approved</th><th data-k="rp" title="distinct repos">repos</th>' if revmode else
+               f'<th data-k="nr">no review</th><th data-k="st" title="no progress for {WAIT_DAYS}+ days">idle ≥{WAIT_DAYS}d</th>' if openmode else
                '<th data-k="rp" title="distinct repos">repos</th><th data-k="ad" title="average days from open to merge">avg days</th>')
     # dropdown lists every configured repo; ones without PRs in this page are marked
     counts = {}
@@ -326,7 +373,11 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
         if not prs:
             continue
         balls = {p["url"]: ball(p) for p in prs}
-        if openmode:
+        mine = {p["url"]: submitted(p) for p in prs} if revmode else {}
+        if revmode:
+            # most recently reviewed first
+            prs = sorted(prs, key=lambda p: mine[p["url"]][-1]["submittedAt"] if mine[p["url"]] else "", reverse=True)
+        elif openmode:
             # the PR that has gone longest without progress first; drafts last
             def order(p):
                 b = balls[p["url"]]
@@ -367,26 +418,47 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name=""):
                     flags.append('<span class="fl conflict" title="has merge conflicts, needs rebase">⚠ conflict</span>'); ftext.append("conflict")
             conflict = int(p.get("mergeable") == "CONFLICTING" and p["state"] == "OPEN")
             days = took(p)
-            if openmode:
+            byline, mv, ncol = "", "", f'<td class="n">{p["comments"]["totalCount"]}</td>'
+            if revmode:
+                subs = mine[p["url"]]
+                mv = verdict(subs)
+                if mv:
+                    vtext, vcls = VERDICT[mv]
+                    flags.insert(0, f'<span class="fl {vcls}" title="their standing review on this PR">{vtext}</span>')
+                    ftext.append(vtext.split(" ", 1)[1])
+                pa = (p.get("author") or {}).get("login") or "ghost"
+                byline = f'<span class="by">by <a href="https://github.com/{e(pa)}" target="_blank">{e(pa)}</a></span> '
+                ftext.append(pa)
+                ncol = f'<td class="n">{len(subs)}</td>'
+                last = subs[-1]["submittedAt"] if subs else p["updatedAt"]
+                tail = (f'<td class="n">{days_ago(last)}d</td>'
+                        f'<td class="n">{days_ago(p["updatedAt"])}d</td>')
+            elif openmode:
                 tail = (f'<td class="n">{days_ago(p["createdAt"])}d</td>'
                         f'<td class="n">{days_ago(p["updatedAt"])}d</td>')
             else:
                 end = p.get("mergedAt") or p["updatedAt"]
                 tail = f'<td class="n">{days}d</td><td class="n">{days_ago(end)}d</td>'
             body.append(
-                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" '
-                f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {" ".join(ftext)}">'
+                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" data-mine="{mv}" '
+                f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {e(" ".join(ftext))}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
-                f'<td class="title"><span class="mrepo">{e(repo.split("/")[-1])}</span>{e(p["title"])}<div>{labels}</div></td>'
+                f'<td class="title"><span class="mrepo">{e(repo.split("/")[-1])}</span>{e(p["title"])}<div>{byline}{labels}</div></td>'
                 f'<td><span class="st {cls}">{e(lab)}</span>{"".join(flags)}</td>'
-                f'<td class="n">{p["comments"]["totalCount"]}</td>'
-                + tail + '</tr>')
+                + ncol + tail + '</tr>')
+    if revmode:
+        heads = ('<th class="n" title="reviews they submitted on this PR">reviews</th>'
+                 '<th class="n" title="their last review, days ago">reviewed</th><th class="n">updated</th>')
+    elif openmode:
+        heads = '<th title="comments">💬</th><th class="n">opened</th><th class="n">updated</th>'
+    else:
+        heads = ('<th title="comments">💬</th><th class="n" title="days from open to merge">took</th>'
+                 '<th class="n" title="merged how long ago">merged</th>')
     main_table = ('<table class="prs"><colgroup><col class="c-repo"><col class="c-num"><col class="c-title">'
                   '<col class="c-st"><col class="c-n"><col class="c-n"><col class="c-n"></colgroup>'
-                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th><th>status</th><th title="comments">💬</th>'
-                  + ('<th class="n">opened</th><th class="n">updated</th>' if openmode else
-                     '<th class="n" title="days from open to merge">took</th><th class="n" title="merged how long ago">merged</th>')
+                  '<thead><tr><th class="repo">repo</th><th>#</th><th>title</th><th>status</th>'
+                  + heads
                   + '</tr></thead><tbody>'
                   + "".join(body) + '</tbody></table>')
 
@@ -435,7 +507,8 @@ tr.grp{{scroll-margin-top:var(--thead-h,37px)}}
 .mrepo{{display:none}}
 .fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:var(--red);font-weight:600}} .ci-wait{{color:var(--warn-fg)}} .ci-ok{{color:var(--ok-fg)}}
 .wait-r{{color:var(--info-fg)}} .wait-a{{color:var(--muted)}} .fl.stale{{color:var(--red);font-weight:600}}
-.gstat .cf{{color:var(--red)}}
+.gstat .cf{{color:var(--red)}} .gstat .ap,.mv-ok{{color:var(--ok-fg)}} .gstat .cr,.mv-cr{{color:var(--warn-fg)}} .mv-c{{color:var(--muted)}}
+.by{{color:var(--muted);font-size:12px;margin-right:6px}}
 nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:var(--head-hover);border-radius:4px}} nav.pages a{{padding:2px 8px}}
 #theme{{float:right;font-size:12px;padding:2px 8px;cursor:pointer;background:var(--input-bg);color:var(--muted);border:1px solid var(--input-bd);border-radius:4px}}
 @media (max-width:1000px){{
@@ -474,7 +547,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 </div>
 <script>
 (function(){{
-  var OPEN={"true" if openmode else "false"};
+  var MODE='{mode}';
   var q=document.getElementById('q'), sel=document.getElementById('repo'), sum=document.getElementById('sum'), cnt=document.getElementById('count');
   var rows=Array.prototype.slice.call(document.querySelectorAll('tr.pr'));
   var ths=Array.prototype.slice.call(document.querySelectorAll('.summary th')), sortKey='n', sortAsc=false;
@@ -489,15 +562,18 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
       r.style.display=ok?'':'none';
       if(!ok) return;
       shown++;
-      var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0,cf:0,days:0,repos:{{}}}});
+      var p=per[r.dataset.login]||(per[r.dataset.login]={{n:0,nr:0,st:0,cf:0,ap:0,cr:0,days:0,repos:{{}}}});
       p.n++; if(r.dataset.status==='no review') p.nr++; if(r.dataset.stale==='1') p.st++; if(r.dataset.conflict==='1') p.cf++;
+      if(r.dataset.mine==='APPROVED') p.ap++; if(r.dataset.mine==='CHANGES_REQUESTED') p.cr++;
       p.days+=(+r.dataset.days||0); p.repos[r.dataset.repo]=1;
     }});
     document.body.classList.toggle('onerepo',!!repo);
     document.querySelectorAll('tr.grp').forEach(function(g){{
-      var p=per[g.dataset.login]||{{n:0,nr:0,st:0,cf:0,days:0}};
+      var p=per[g.dataset.login]||{{n:0,nr:0,st:0,cf:0,ap:0,cr:0,days:0}};
       g.style.display=p.n?'':'none'; g.querySelector('small').textContent=p.n;
-      g.querySelector('.gstat').innerHTML=OPEN
+      g.querySelector('.gstat').innerHTML=MODE==='review'
+        ?(p.ap?'<b class="ap">'+p.ap+' approved</b>':'')+(p.cr?'<b class="cr">'+p.cr+' changes requested</b>':'')
+        :MODE==='open'
         ?(p.nr?'<b class="nr">'+p.nr+' no review</b>':'')+(p.st?'<b class="sl">'+p.st+' idle ≥{WAIT_DAYS}d</b>':'')+(p.cf?'<b class="cf">'+p.cf+' conflict</b>':'')
         :(p.n?'<b>avg '+Math.round(p.days/p.n)+'d to merge</b>':'');
     }});
@@ -509,9 +585,10 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     }});
     ths.forEach(function(t){{t.classList.toggle('on',t.dataset.k===sortKey);t.classList.toggle('asc',sortAsc);}});
     sum.innerHTML=logins.map(function(l){{var p=per[l];
-      var c=OPEN?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td class="rp">'+p.rp+'</td><td>'+p.ad+'d</td>';
+      var c=MODE==='review'?'<td>'+(p.ap||'')+'</td><td class="rp">'+p.rp+'</td>'
+           :MODE==='open'?'<td>'+(p.nr||'')+'</td><td>'+(p.st||'')+'</td>':'<td class="rp">'+p.rp+'</td><td>'+p.ad+'d</td>';
       return '<tr data-login="'+l+'"><td><a href="#u-'+l+'">'+l+'</a></td><td>'+p.n+'</td>'+c+'</tr>';}}).join('');
-    cnt.textContent=shown+' PRs from '+logins.length+' people';
+    cnt.textContent=shown+(MODE==='review'?' PRs reviewed by ':' PRs from ')+logins.length+' people';
     try{{localStorage.setItem('cprs.repo',repo);}}catch(e){{}}
     curLogin=null; if(thead) spy();   // the list was rebuilt: re-mark who is on screen
   }}
@@ -582,8 +659,11 @@ def main():
     ap.add_argument("--people", help="comma-separated logins, overrides the file")
     ap.add_argument("--repo", action="append", help="repeatable; overrides repos in the file")
     ap.add_argument("--all-repos", action="store_true", help="don't filter by repo list")
-    ap.add_argument("--state", choices=["open", "merged", "closed"], default="open")
-    ap.add_argument("--since", help="YYYY-MM-DD, used with --state merged/closed")
+    ap.add_argument("--state", choices=["open", "merged", "closed", "any"], default="open")
+    ap.add_argument("--since", help="YYYY-MM-DD; merged/closed on or after (author), reviewed on or after (reviewer), "
+                                    "updated on or after (open/any)")
+    ap.add_argument("--role", choices=["author", "reviewer"], default="author",
+                    help="author: PRs they opened; reviewer: PRs by others that they reviewed")
     ap.add_argument("--out", default="community_prs.html")
     ap.add_argument("--cache-dir", default=CACHE_DIR,
                     help=f"where raw results are kept (default {CACHE_DIR}, env COMMUNITY_PRS_CACHE)")
@@ -602,7 +682,7 @@ def main():
 
     # One cache file per query shape, so kafka-only and all-repos runs don't evict each other.
     key = {"people": sorted(p.lower() for p in people), "repos": sorted(repos),
-           "state": args.state, "since": args.since, "all_repos": args.all_repos,
+           "state": args.state, "since": args.since, "all_repos": args.all_repos, "role": args.role,
            "v": 2}   # v2: open PRs carry timelineItems; bump when the query shape changes
     cache_path = os.path.join(args.cache_dir, hashlib.sha1(json.dumps(key, sort_keys=True).encode()).hexdigest() + ".json")
     result = None
@@ -617,7 +697,7 @@ def main():
         except (OSError, KeyError, ValueError):
             pass
     if result is None:
-        result = fetch(people, repos, args.state, args.since, args.all_repos)
+        result = fetch(people, repos, args.state, args.since, args.all_repos, args.role)
         if not args.no_cache:
             os.makedirs(args.cache_dir, exist_ok=True)
             tmp = cache_path + ".tmp"
@@ -627,9 +707,9 @@ def main():
 
     with open(args.out, "w") as f:
         nav = [tuple(n.split("=", 1)) for n in (args.nav or []) if "=" in n]
-        f.write(render(result, repos, args.state, args.since, dispatch_target(args.dispatch), nav, args.out))
+        f.write(render(result, repos, args.state, args.since, dispatch_target(args.dispatch), nav, args.out, args.role))
     total = sum(len(v) for v in result.values())
-    print(f"{total} PRs from {len(people)} people -> {args.out}")
+    print(f"{total} PRs {'reviewed by' if args.role == 'reviewer' else 'from'} {len(people)} people -> {args.out}")
 
 
 if __name__ == "__main__":
