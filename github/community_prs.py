@@ -455,7 +455,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name="", ro
                 mv = verdict(subs)
                 if mv:
                     vtext, vcls, vword = VERDICT.get(mv, (mv.lower(), "mv-c", mv.lower()))
-                    flags.insert(0, f'<span class="fl {vcls}" title="their standing review on this PR">{e(vtext)}</span>')
+                    flags.insert(0, f'<span class="fl mv {vcls}" title="their standing review on this PR; click to show only these">{e(vtext)}</span>')
                     ftext.append(vword)
                 pa = (p.get("author") or {}).get("login") or "ghost"
                 byline = f'<span class="by">by <a href="https://github.com/{e(pa)}" target="_blank">{e(pa)}</a></span> '
@@ -535,6 +535,9 @@ tr.grp{{scroll-margin-top:var(--thead-h,37px)}}
 .summary{{width:100%}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
+.prs .st,.prs .mv{{cursor:pointer}} .prs .st:hover,.prs .mv:hover{{text-decoration:underline}}
+#fchip{{margin:0 0 10px;font-size:12px}} #fchip[hidden]{{display:none}}
+#fchip button{{font:inherit;padding:1px 4px 1px 8px;cursor:pointer;background:var(--info-bg);color:var(--info-fg);border:0;border-radius:10px}}
 .mrepo{{display:none}}
 .fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:var(--red);font-weight:600}} .ci-wait{{color:var(--warn-fg)}} .ci-ok{{color:var(--ok-fg)}}
 .wait-r{{color:var(--info-fg)}} .wait-a{{color:var(--muted)}} .fl.stale{{color:var(--red);font-weight:600}}
@@ -571,6 +574,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 <select id="repo"><option value="">all repos</option>{options}</select>
 <input id="q" placeholder="filter: login / title / status">
 <div id="count"></div>
+<div id="fchip" hidden></div>
 </div>
 <div class="people"><table class="summary"><thead><tr><th data-k="login">login</th><th data-k="n">PRs</th>{sumcols}</tr></thead><tbody id="sum"></tbody></table></div>
 </aside>
@@ -589,7 +593,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
   function apply(){{
     var v=q.value.toLowerCase(), repo=sel.value, per={{}}, shown=0;
     rows.forEach(function(r){{
-      var ok=(!repo||r.dataset.repo===repo)&&r.dataset.text.toLowerCase().includes(v);
+      var ok=(!repo||r.dataset.repo===repo)&&(!fst||r.dataset[fst.k]===fst.v)&&r.dataset.text.toLowerCase().includes(v);
       r.style.display=ok?'':'none';
       if(!ok) return;
       shown++;
@@ -624,6 +628,21 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     curLogin=null; if(thead) spy();   // the list was rebuilt: re-mark who is on screen
   }}
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
+  // click a status badge (or a reviewer's verdict) to show only PRs with the same one; click again to clear
+  var fst=null, chip=document.getElementById('fchip');
+  function setStatus(f){{
+    fst=f; chip.hidden=!f;
+    chip.innerHTML=f?'<button title="clear">'+f.label.replace(/[&<>"]/g,'')+' &times;</button>':'';
+    apply();
+  }}
+  chip.addEventListener('click',function(){{setStatus(null);}});
+  document.querySelector('.prs').addEventListener('click',function(ev){{
+    var b=ev.target.closest('.st,.mv'), r=b&&b.closest('tr.pr'); if(!r) return;
+    var f=b.classList.contains('mv')?{{k:'mine',v:r.dataset.mine,label:b.textContent}}:{{k:'status',v:r.dataset.status,label:b.textContent}};
+    setStatus(fst&&fst.k===f.k&&fst.v===f.v?null:f);
+    r.scrollIntoView({{block:'nearest'}});
+  }});
+  document.addEventListener('keydown',function(ev){{if(ev.key==='Escape'&&fst&&document.activeElement!==q) setStatus(null);}});
   q.addEventListener('input',apply); sel.addEventListener('change',apply); apply();
 
   // keep the left list in step with the right: highlight the person on screen,
