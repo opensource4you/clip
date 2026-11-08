@@ -111,7 +111,7 @@ def search_string(login, state, since, scope="", role="author"):
     return q
 
 
-def build_query(authors, state, since, scope="", cursors=None, role="author"):
+def build_query(authors, state, since, scope="", cursors=None, role="author", per=PER_AUTHOR):
     # only open PRs need the timeline; it makes the query noticeably heavier
     timeline = f'''
       timelineItems(last: {TIMELINE}, itemTypes: [PULL_REQUEST_COMMIT, PULL_REQUEST_REVIEW, ISSUE_COMMENT]) {{
@@ -130,14 +130,17 @@ def build_query(authors, state, since, scope="", cursors=None, role="author"):
         # reviewer mode: this person's own reviews on the PR (verdict, count, when)
         mine = (f'\n      mine: reviews(author: "{a}", last: 20) {{ totalCount nodes {{ state submittedAt }} }}'
                 if role == "reviewer" else "")
+        # mergeable and the CI rollup are the expensive fields; the reviews page doesn't need them
+        checks = "" if role == "reviewer" else '''
+      mergeable
+      commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'''
         parts.append(f'''
-  a{i}: search(type: ISSUE, query: "{q}", first: {PER_AUTHOR}{after}) {{
+  a{i}: search(type: ISSUE, query: "{q}", first: {per}{after}) {{
     issueCount
     pageInfo {{ hasNextPage endCursor }}
     nodes {{ ... on PullRequest {{
-      number title url isDraft createdAt updatedAt mergedAt state reviewDecision mergeable
-      author {{ login }}
-      commits(last: 1) {{ nodes {{ commit {{ statusCheckRollup {{ state }} }} }} }}
+      number title url isDraft createdAt updatedAt mergedAt state reviewDecision
+      author {{ login }}{checks}
       repository {{ nameWithOwner }}
       labels(first: 6) {{ nodes {{ name }} }}
       comments {{ totalCount }}
@@ -147,16 +150,22 @@ def build_query(authors, state, since, scope="", cursors=None, role="author"):
     return "query {" + "".join(parts) + "\n}"
 
 
-def gh_graphql(query):
-    for attempt in range(RETRIES):
+class Transient(Exception):
+    """GitHub kept timing out (502/503/504) on this request."""
+
+
+def gh_graphql(query, retries=RETRIES):
+    for attempt in range(retries):
         r = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
                            capture_output=True, text=True)
         transient = r.returncode != 0 and any(c in r.stderr for c in ("502", "503", "504", "timeout", "rate limit"))
-        if transient and attempt < RETRIES - 1:
+        if transient and attempt < retries - 1:
             wait = 3 * (attempt + 1)
             print(f"  transient error ({r.stderr.strip().splitlines()[-1]}), retry in {wait}s", file=sys.stderr)
             time.sleep(wait)
             continue
+        if transient:
+            raise Transient(r.stderr)
         if r.returncode != 0:
             sys.exit(f"gh api failed:\n{r.stderr}")
         data = json.loads(r.stdout)
@@ -165,19 +174,38 @@ def gh_graphql(query):
         return data["data"]
 
 
+MIN_PER = 10   # smallest page size tried before giving up on a request
+
+
 def fetch_chunk(chunk, state, since, scope, role="author"):
+    """Fetch every page for these logins. A request that keeps timing out is retried
+    smaller: first fewer PRs per page, then fewer people per request."""
     out = {login: [] for login in chunk}
     cursors, pending = {}, list(chunk)
+    per, width = PER_AUTHOR, len(chunk)
     while pending:
-        data = gh_graphql(build_query(pending, state, since, scope, cursors, role))
+        batch = pending[:width]
+        shrinkable = per > MIN_PER or width > 1
+        try:
+            data = gh_graphql(build_query(batch, state, since, scope, cursors, role, per),
+                              retries=2 if shrinkable else RETRIES)
+        except Transient as ex:
+            if not shrinkable:
+                sys.exit(f"gh api failed:\n{ex}")
+            if per > MIN_PER:
+                per = max(MIN_PER, per // 2)
+            else:
+                width = max(1, width // 2)
+            print(f"  shrinking request to {width} people x {per} PRs", file=sys.stderr)
+            continue
         nxt = []
-        for j, login in enumerate(pending):
+        for j, login in enumerate(batch):
             block = data[f"a{j}"]
             out[login].extend(n for n in block["nodes"] if n)
             if block["pageInfo"]["hasNextPage"]:
                 cursors[login] = block["pageInfo"]["endCursor"]
                 nxt.append(login)
-        pending = nxt
+        pending = nxt + pending[width:]
     return out
 
 
