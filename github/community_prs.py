@@ -347,8 +347,11 @@ def dispatch_target(cli):
     return None
 
 
-VERDICT = {"APPROVED": ("✓ approved", "mv-ok"), "CHANGES_REQUESTED": ("± changes requested", "mv-cr"),
-           "COMMENTED": ("💬 commented", "mv-c"), "DISMISSED": ("dismissed", "mv-c")}
+# verdict -> (shown text, css class, word for the filter box)
+VERDICT = {"APPROVED": ("✓ approved", "mv-ok", "approved"),
+           "CHANGES_REQUESTED": ("± changes requested", "mv-cr", "changes requested"),
+           "COMMENTED": ("💬 commented", "mv-c", "commented"),
+           "DISMISSED": ("✕ dismissed", "mv-c", "dismissed")}
 
 
 def render(result, repos, state, since, dispatch=None, nav=None, out_name="", role="author"):
@@ -451,9 +454,9 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name="", ro
                 subs = mine[p["url"]]
                 mv = verdict(subs)
                 if mv:
-                    vtext, vcls = VERDICT[mv]
-                    flags.insert(0, f'<span class="fl {vcls}" title="their standing review on this PR">{vtext}</span>')
-                    ftext.append(vtext.split(" ", 1)[1])
+                    vtext, vcls, vword = VERDICT.get(mv, (mv.lower(), "mv-c", mv.lower()))
+                    flags.insert(0, f'<span class="fl {vcls}" title="their standing review on this PR">{e(vtext)}</span>')
+                    ftext.append(vword)
                 pa = (p.get("author") or {}).get("login") or "ghost"
                 byline = f'<span class="by">by <a href="https://github.com/{e(pa)}" target="_blank">{e(pa)}</a></span> '
                 ftext.append(pa)
