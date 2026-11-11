@@ -35,8 +35,8 @@ gh api -X POST repos/opensource4you/clip/actions/runners/<ID>/labels -f 'labels[
    ```
    之後看到外人的 PR 等待 approve 時，先確認沒改到 `.github/` 再按。
 2. VM 上不要放任何憑證（SSH key、雲端 token、gh 登入），網路跟內部環境隔開。
-3. log 是公開的，workflow 不要印出任何機密。`github/Jenkinsfile` 那種用參數傳 token 的作法
-   不能直接搬過來（workflow_dispatch 的 input 會顯示在 run 頁面）。
+3. log 是公開的，workflow 不要印出任何機密。token 不能用 workflow_dispatch 的 input 傳
+   （input 會顯示在 run 頁面），要放在 secrets。
 
 ## 需要的工具
 

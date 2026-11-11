@@ -2,7 +2,7 @@
 """
 下載指定 GitHub 帳號在指定 repo 的活動紀錄，並替他開的 PR 算一個「重要性」分數。
 
-只在終端機印出統計摘要。API 回應會連同 ETag 存在 ~/.cache/gh_activity/，重跑時沒變的回 304，不扣額度。
+預設只在終端機印出統計摘要（--dump 會另外替每個人寫一個 markdown 檔）。API 回應會連同 ETag 存在 ~/.cache/gh_activity/，重跑時沒變的回 304，不扣額度。
 另外每個 PR 抓到的原始資料也會存一份（~/.cache/gh_activity/pr/），搜尋結果裡的 updated_at 沒變的 PR
 整包重用、一個請求都不發，所以重跑只會重抓這段時間有動過的 PR。
 stderr 會印每個階段的秒數、請求數、304 命中數和等待額度的時間，方便看時間花在哪。
@@ -61,7 +61,7 @@ GRAPHQL = "https://api.github.com/graphql"
 TOKEN = os.environ.get("GITHUB_TOKEN")
 SEARCHES_PER_REQUEST = 5    # 一個 GraphQL 請求裡用 alias 塞幾個搜尋（每個搜尋一頁 100 筆約 1 點）。
                             # GitHub 是逐個處理，塞越多單一請求越慢，所以塞少一點、多個請求同時送
-SEARCH_WORKERS = 10         # 同時送幾個 GraphQL 搜尋請求。126 人 × 3 種關係約 40 個搜尋 = 8 個請求，10 個 worker 一輪跑完
+SEARCH_WORKERS = 10         # 同時送幾個 GraphQL 搜尋請求。一百多人 × 3 種關係約幾十個搜尋、十個左右的請求，10 個 worker 大致一輪跑完
 
 # ---- 權重，自行調整 ----------------------------------------------------------
 WEIGHTS = {
@@ -78,7 +78,7 @@ WEIGHTS = {
     "merged_under_2h": -1,
 }
 # ---- 總分怎麼組成 -----------------------------------------------------------
-# 總分 = review 分 + 重要 PR 分 + 一般 PR 分
+# 總分 = review 分 + 出題分 + 重要 PR 分 + 一般 PR 分
 # 目標排序：review ≈ 重要貢獻 > 一般貢獻。大致的單位分數：
 #   實質 review（幾則行內意見、approve 且 merge）≈ 4～6，深度 review（行內 ≥ DEEP_REVIEW_INLINE）≈ 8～10，
 #   帶非 committer 再 +8；只按 approve 的 review（沒留實質意見，含只寫 LGTM）= REVIEW_WEIGHTS["approve_only"] ≈ 0.3
@@ -959,10 +959,10 @@ class PRCache:
             pass
 
 
-def analyze_repo(repo, users, since, until, with_commits=True, jira_names=None, jira_project=None, jira_url=DEFAULT_JIRA_URL):
+def analyze_repo(repo, users, since, until, jira_names=None, jira_project=None, jira_url=DEFAULT_JIRA_URL):
     """抓一群人在一個 repo 的活動，回傳 {user: 統計結果}。
     搜尋是分批合併查的，每個 PR 的留言只抓一次，再拆給有參與的人。
-    with_commits 目前保留參數但一律會抓 commits（判斷關掉但有進 default branch 的 PR 要用）。
+    commits 一律會抓（判斷關掉但有進 default branch 的 PR 要用）。
     jira_project：這個 repo 的題目在 JIRA 時的 project key；None 表示從 commit 訊息自動判斷，"" 表示強制不用 JIRA。"""
     users = list(users)
     user_set = set(users)
@@ -1440,7 +1440,7 @@ def main():
     ap.add_argument("--until", help="YYYY-MM-DD，預設為今天")
     ap.add_argument("--detail", action="store_true", help="總表之後再印每個人的明細（預設只印總表）")
     ap.add_argument("--format", choices=["text", "markdown"], default="text",
-                    help="輸出格式：text（預設，terminal / Jenkins console 好讀）或 markdown")
+                    help="輸出格式：text（預設，terminal 好讀）或 markdown")
     ap.add_argument("--dump", metavar="DIR",
                     help="另外替每個人寫一個 DIR/<帳號>.md：評分明細、區間內所有留言全文（含行內留言的 diff 片段）、本人開的 PR 的描述")
     ap.add_argument("--no-cache", action="store_true", help="不使用快取（ETag 和每個 PR 的原始資料都不用）")
@@ -1503,13 +1503,12 @@ def main():
         verify_or_semantics(first, since, repo_users[first])
 
     # 逐 repo 抓。commit 清單一律要抓（判斷「關掉但有進 default branch」的 PR 要用）
-    with_commits = True
     t_all, s_all = time.time(), _snapshot()
     results_by_user = {p["user"]: [] for p in people}
     skipped = {}
     for repo, users in repo_users.items():
         try:
-            for u, res in analyze_repo(repo, users, since, until, with_commits,
+            for u, res in analyze_repo(repo, users, since, until,
                                        jira_names=jira_names, jira_project=jira_cfg.get(repo), jira_url=jira_url).items():
                 results_by_user[u].append(res)
         except RepoInaccessible as e:

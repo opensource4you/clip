@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """List community members' PRs across repos as one HTML page.
 
-Reads logins from people.json (same file gh_activity.py uses) and queries
+Reads logins from a people file (people_all.json by default, same format
+gh_activity.py uses) and queries
 GitHub via `gh api graphql`, batching several authors per request.
 
 Usage:
@@ -13,8 +14,8 @@ Usage:
   python3 community_prs.py --people-file people_all.json --role reviewer --state any --since 2026-10-01
 
 The generated page has a repo dropdown, so one fetch covers every project.
-For open PRs it also shows who the PR is waiting on (reviewer / merge / author)
-and for how long, worked out from recent commits, reviews and comments.
+For open PRs it also shows how long the PR has gone without progress, worked out
+from recent commits, reviews and comments.
 
 --role reviewer lists the PRs each person reviewed (submitted a review on) instead
 of the ones they wrote, with their own verdict and review count. Plain conversation
@@ -390,7 +391,6 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name="", ro
     revmode = role == "reviewer"
     title = (f"Community {'reviews' if revmode else 'PRs'} "
              f"({'all states' if state == 'any' else state}{', since ' + since if since else ''})")
-    total = sum(len(v) for v in result.values())
     stale_key = "updatedAt"
     openmode = state == "open"
     mode = "review" if revmode else "open" if openmode else "done"
@@ -554,7 +554,7 @@ tr.grp{{scroll-margin-top:var(--thead-h,37px)}}
 #fchip button{{font:inherit;padding:1px 4px 1px 8px;cursor:pointer;background:var(--info-bg);color:var(--info-fg);border:0;border-radius:10px}}
 .mrepo{{display:none}}
 .fl{{display:block;font-size:11px;margin-top:3px;white-space:nowrap}} .ci-bad,.conflict{{color:var(--red);font-weight:600}} .ci-wait{{color:var(--warn-fg)}} .ci-ok{{color:var(--ok-fg)}}
-.wait-r{{color:var(--info-fg)}} .wait-a{{color:var(--muted)}} .fl.stale{{color:var(--red);font-weight:600}}
+.wait-r{{color:var(--info-fg)}} .fl.stale{{color:var(--red);font-weight:600}}
 .gstat .cf{{color:var(--red)}} .gstat .ap,.mv-ok{{color:var(--ok-fg)}} .gstat .cr,.mv-cr{{color:var(--warn-fg)}} .mv-c{{color:var(--muted)}}
 .by{{color:var(--muted);font-size:12px;margin-right:6px}}
 nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;background:var(--head-hover);border-radius:4px}} nav.pages a{{padding:2px 8px}}
@@ -719,7 +719,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--people-file", default="people.json", help='{"users": [...], "repos": [...]}')
+    ap.add_argument("--people-file", default="people_all.json", help='{"users": [...], "repos": [...]}')
     ap.add_argument("--people", help="comma-separated logins, overrides the file")
     ap.add_argument("--repo", action="append", help="repeatable; overrides repos in the file")
     ap.add_argument("--all-repos", action="store_true", help="don't filter by repo list")
