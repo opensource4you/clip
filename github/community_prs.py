@@ -151,24 +151,38 @@ def build_query(authors, state, since, scope="", cursors=None, role="author", pe
 
 
 class Transient(Exception):
-    """GitHub kept timing out (502/503/504) on this request."""
+    """GitHub kept timing out (502/503/504) or cut the response short on this request."""
+
+
+# stderr fragments that mean "GitHub gave up on this request, try again".
+# A timed-out query sometimes comes back as an empty or cut-off body instead of a
+# clean 502, which gh reports as a JSON parse error.
+TRANSIENT = ("502", "503", "504", "timeout", "rate limit",
+             "unexpected end of JSON input", "unexpected EOF", "invalid character",
+             "connection reset", "stream error")
 
 
 def gh_graphql(query, retries=RETRIES):
     for attempt in range(retries):
         r = subprocess.run(["gh", "api", "graphql", "-f", f"query={query}"],
                            capture_output=True, text=True)
-        transient = r.returncode != 0 and any(c in r.stderr for c in ("502", "503", "504", "timeout", "rate limit"))
+        why = (r.stderr.strip().splitlines() or ["no error message"])[-1]
+        transient = r.returncode != 0 and any(c in r.stderr for c in TRANSIENT)
+        data = None
+        if r.returncode == 0:
+            try:
+                data = json.loads(r.stdout)
+            except ValueError:   # exit 0 but the body was cut off
+                transient, why = True, "truncated response"
         if transient and attempt < retries - 1:
             wait = 3 * (attempt + 1)
-            print(f"  transient error ({r.stderr.strip().splitlines()[-1]}), retry in {wait}s", file=sys.stderr)
+            print(f"  transient error ({why}), retry in {wait}s", file=sys.stderr)
             time.sleep(wait)
             continue
         if transient:
-            raise Transient(r.stderr)
+            raise Transient(r.stderr or why)
         if r.returncode != 0:
             sys.exit(f"gh api failed:\n{r.stderr}")
-        data = json.loads(r.stdout)
         if data.get("errors"):
             sys.exit(f"GraphQL errors:\n{json.dumps(data['errors'], indent=2)}")
         return data["data"]
