@@ -131,8 +131,9 @@ def build_query(authors, state, since, scope="", cursors=None, role="author", pe
         # reviewer mode: this person's own reviews on the PR (verdict, count, when)
         mine = (f'\n      mine: reviews(author: "{a}", last: 20) {{ totalCount nodes {{ state submittedAt }} }}'
                 if role == "reviewer" else "")
-        # mergeable and the CI rollup are the expensive fields; the reviews page doesn't need them
-        checks = "" if role == "reviewer" else '''
+        # mergeable and the CI rollup are the expensive fields, and only open PRs show them;
+        # asking for them on merged/closed PRs is what trips GitHub's per-query resource limit
+        checks = "" if role == "reviewer" or state not in ("open", "any") else '''
       mergeable
       commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }'''
         parts.append(f'''
@@ -158,6 +159,11 @@ class Transient(Exception):
 # stderr fragments that mean "GitHub gave up on this request, try again".
 # A timed-out query sometimes comes back as an empty or cut-off body instead of a
 # clean 502, which gh reports as a JSON parse error.
+class TooHeavy(Transient):
+    """GitHub refused the query as too expensive; retrying the same request can't help."""
+
+
+TOO_HEAVY = "Resource limits for this query exceeded"
 TRANSIENT = ("502", "503", "504", "timeout", "rate limit",
              "unexpected end of JSON input", "unexpected EOF", "invalid character",
              "connection reset", "stream error")
@@ -169,6 +175,8 @@ def gh_graphql(query, retries=RETRIES):
                            capture_output=True, text=True)
         why = (r.stderr.strip().splitlines() or ["no error message"])[-1]
         transient = r.returncode != 0 and any(c in r.stderr for c in TRANSIENT)
+        if TOO_HEAVY in r.stderr or TOO_HEAVY in r.stdout:
+            raise TooHeavy(TOO_HEAVY)
         data = None
         if r.returncode == 0:
             try:
@@ -189,12 +197,13 @@ def gh_graphql(query, retries=RETRIES):
         return data["data"]
 
 
-MIN_PER = 10   # smallest page size tried before giving up on a request
+MIN_PER = 5    # smallest page size tried before giving up on a request
 
 
 def fetch_chunk(chunk, state, since, scope, role="author"):
-    """Fetch every page for these logins. A request that keeps timing out is retried
-    smaller: first fewer PRs per page, then fewer people per request."""
+    """Fetch every page for these logins. A request that keeps timing out, or that GitHub
+    rejects as too expensive, is retried smaller: first fewer PRs per page, then fewer
+    people per request."""
     out = {login: [] for login in chunk}
     cursors, pending = {}, list(chunk)
     per, width = PER_AUTHOR, len(chunk)
@@ -211,7 +220,8 @@ def fetch_chunk(chunk, state, since, scope, role="author"):
                 per = max(MIN_PER, per // 2)
             else:
                 width = max(1, width // 2)
-            print(f"  shrinking request to {width} people x {per} PRs", file=sys.stderr)
+            why = "too expensive" if isinstance(ex, TooHeavy) else "timed out"
+            print(f"  {why}, shrinking request to {width} people x {per} PRs", file=sys.stderr)
             continue
         nxt = []
         for j, login in enumerate(batch):
