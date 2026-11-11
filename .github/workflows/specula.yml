@@ -48,7 +48,7 @@ on:
       model:
         description: Claude 模型
         type: choice
-        options: [claude-opus-5-5, claude-sonnet-5-5]
+        options: [claude-fable-5-2, claude-opus-5-5, claude-sonnet-5-5]
         default: claude-opus-5-5
       max_turns:
         description: 每個 phase 最多幾輪（防止卡在迴圈一直花錢）
