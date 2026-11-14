@@ -77,8 +77,6 @@ jobs:
         working-directory: kafka
         continue-on-error: true
         run: |
-          # run step 預設是 bash -e，沒有 pipefail；不加的話 | tee 會吃掉 run_tests.sh 的 exit code，
-          # 測試失敗 step 還是 success，後面的 Mark failed 永遠不會跑
           set -o pipefail
           total_mb=$(free -m | awk '/^Mem:/{print $2}')
           avail_mb=$(( total_mb - 4096 ))       # 預留 4GB 給系統和 runner
