@@ -689,22 +689,39 @@ def user_batches(users, base_query, rel):
 
 def search_prs(repo, since, users):
     """搜出這群人在 repo 裡開過、留言過、review 過的 PR（去重）。回傳 (pr 清單, 搜尋次數)。
-    三種關係各分批，所有批次一起丟給 search_many；撞到 1000 筆上限的批次對半拆開重搜。"""
-    base = f"is:pr repo:{repo} updated:>={since}"
-    todo = [(rel, batch) for rel in ("author", "commenter", "reviewed-by") for batch in user_batches(users, base, rel)]
+    三種關係各分批，所有批次一起丟給 search_many；撞到 1000 筆上限的批次對半拆開重搜。
+    拆到只剩一個帳號還超過 1000 筆（區間拉到幾年時，量大的 reviewer 會這樣），改把 updated 的日期區間對半拆，
+    一直拆到每段都在 1000 筆以內。最後一段維持 updated:>=日期 不設上界，執行期間才更新的 PR 也撈得到。"""
+    head = f"is:pr repo:{repo}"
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def query(rel, batch, s, u):
+        when = f"updated:>={s}" if u is None else f"updated:{s}..{u}"
+        return f"{head} {when}" + "".join(f" {rel}:{x}" for x in batch)
+
+    # 分批時用最長的日期寫法估長度，之後拆日期區間也不會超過 256 字元
+    base = f"{head} updated:{since}..{since}"
+    todo = [(rel, batch, since, None) for rel in ("author", "commenter", "reviewed-by")
+            for batch in user_batches(users, base, rel)]
     found, n_queries = {}, 0
     while todo:
-        qs = {base + "".join(f" {rel}:{u}" for u in batch): (rel, batch) for rel, batch in todo}
+        qs = {query(*t): t for t in todo}
         n_queries += len(qs)
         todo = []
         for q, (items, total) in search_many(list(qs)).items():
-            rel, batch = qs[q]
+            rel, batch, s, u = qs[q]
             if total > 1000 and len(batch) > 1:
                 mid = len(batch) // 2
-                todo += [(rel, batch[:mid]), (rel, batch[mid:])]
+                todo += [(rel, batch[:mid], s, u), (rel, batch[mid:], s, u)]
+                continue
+            if total > 1000 and s < (u or today):
+                d0, d1 = datetime.strptime(s, "%Y-%m-%d"), datetime.strptime(u or today, "%Y-%m-%d")
+                mid = d0 + (d1 - d0) / 2
+                todo += [(rel, batch, s, mid.strftime("%Y-%m-%d")),
+                         (rel, batch, (mid + timedelta(days=1)).strftime("%Y-%m-%d"), u)]
                 continue
             if total > 1000:
-                print(f"  警告：{rel}:{batch[0]} 搜尋結果超過 1000 筆上限，請縮小日期區間", file=sys.stderr)
+                print(f"  警告：{rel}:{batch[0]} 在 {s} 單日的搜尋結果超過 1000 筆上限，結果被截斷", file=sys.stderr)
             for i in items:
                 found.setdefault(i["number"], i)
     prs = [{"number": i["number"], "title": i["title"], "author": (i.get("author") or {}).get("login") or "ghost",
