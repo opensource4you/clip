@@ -16,6 +16,15 @@ stderr 會印每個階段的秒數、請求數、304 命中數和等待額度的
   python gh_activity.py --config people.json --dump out/                  # 另外替每個人寫一個 out/<帳號>.md：
                                                                            # 評分明細 + 區間內所有留言全文（含行內留言的 diff 片段）
                                                                            # + 本人開的 PR 的描述全文
+  python gh_activity.py --config people.json --cache-pull --cache-push    # 跑之前先從 GitHub 拉快取、跑完再推回去（見下方「快取的遠端備份」）
+  python gh_activity.py --cache-pull                                       # 只拉快取，不跑評比（--cache-push 同理）
+
+快取的遠端備份：整個快取目錄打包成一個 tar.gz，放在 opensource4you/clip 的 Release（tag 是 cache）底下當附件，
+不進 git 歷史。要換 repo 用 --cache-repo 或環境變數 GH_ACTIVITY_CACHE_REPO。
+需要裝 GitHub CLI（gh）；拉不需要權限，推的話 gh 用的身分對那個 repo 要有寫入權限。
+  - --cache-pull：開跑前下載並解開。本機已有而且比較新的檔案不會被蓋掉，所以和本機快取是合併，不是取代。
+  - --cache-push：全部 repo 抓完之後打包上傳，覆蓋舊的附件。Release 不存在會自動建立（repo 至少要有一個 commit）。
+  - 兩個一起給就是「拉 → 跑 → 推」，換機器或多人輪流跑都接得上。
 
 people.json 格式（每個人都查全部 repo）：
   {
@@ -51,7 +60,7 @@ nit（nit: 開頭、行尾空白、換行、typo、縮排，見 is_nit）深度�
 
 多 repo 的合併規則：總分各 repo 相加；品質分把該人所有 repo 的 PR 放在一起取前 N。
 """
-import argparse, hashlib, http.client, json, math, os, re, sys, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error
+import argparse, hashlib, http.client, json, math, os, re, shutil, subprocess, sys, tarfile, tempfile, threading, time, unicodedata, urllib.parse, urllib.request, urllib.error
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -207,6 +216,103 @@ _cache_enabled = True
 
 def _cache_path(url):
     return os.path.join(CACHE_DIR, hashlib.sha1(url.encode()).hexdigest() + ".json")
+
+
+# ---- 快取的遠端備份：打包成一個 tar.gz，放在某個 GitHub repo 的 Release 附件 ------------------
+# 用 gh CLI 而不是自己打 API：下載附件要跟著轉址到儲存服務、上傳走另一個 host，gh 都處理好了，
+# 而且 gh 有自己的登入身分，不必讓抓資料用的唯讀 GITHUB_TOKEN 多開寫入權限。
+CACHE_REPO = "opensource4you/clip"          # 預設放快取備份的 repo，可用 --cache-repo 或 GH_ACTIVITY_CACHE_REPO 改
+CACHE_TAG = "cache"                         # Release 的 tag，只是放附件的容器，和程式版本無關
+CACHE_ASSET = "gh_activity_cache.tar.gz"
+CACHE_ASSET_MAX = 2 * 1024 ** 3             # Release 單一附件的大小上限
+
+
+def _gh(*args):
+    if not shutil.which("gh"):
+        sys.exit("--cache-pull / --cache-push 需要 GitHub CLI（gh）：https://cli.github.com/")
+    return subprocess.run(["gh", *args], capture_output=True, text=True)
+
+
+def _gh_error(r):
+    return (r.stderr or r.stdout).strip().splitlines()[-1:] or ["（沒有錯誤訊息）"]
+
+
+def cache_pull(repo):
+    """從 repo 的 Release 下載快取並解到 CACHE_DIR。本機已有且不比遠端舊的檔案保留不動（合併，不是取代）。
+    下載不到（第一次用、還沒推過）只警告，照常往下跑。"""
+    t0 = time.time()
+    print(f"下載快取：{repo} 的 release {CACHE_TAG} ...", file=sys.stderr)
+    with tempfile.TemporaryDirectory() as tmp:
+        r = _gh("release", "download", CACHE_TAG, "-R", repo, "-p", CACHE_ASSET, "-D", tmp)
+        path = os.path.join(tmp, CACHE_ASSET)
+        if r.returncode or not os.path.exists(path):
+            print(f"  沒有拉到快取（{_gh_error(r)[0]}），用本機現有的快取繼續", file=sys.stderr)
+            return False
+        size, new, kept = os.path.getsize(path), 0, 0
+        root = os.path.realpath(CACHE_DIR)
+        with tarfile.open(path) as tar:
+            for m in tar:
+                # 只收一般檔案、只收 .json、不准跑出快取目錄：壓縮檔是從網路來的，不照單全收
+                dest = os.path.realpath(os.path.join(root, m.name))
+                if not m.isfile() or not m.name.endswith(".json") or not dest.startswith(root + os.sep):
+                    continue
+                if os.path.exists(dest) and os.path.getmtime(dest) >= m.mtime:
+                    kept += 1
+                    continue
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with tar.extractfile(m) as src, open(dest + ".tmp", "wb") as f:
+                    shutil.copyfileobj(src, f)
+                os.utime(dest + ".tmp", (m.mtime, m.mtime))
+                os.replace(dest + ".tmp", dest)
+                new += 1
+    print(f"  {size / 1e6:.1f} MB，寫入 {new} 個檔案、本機較新而保留 {kept} 個，{time.time() - t0:.1f}s", file=sys.stderr)
+    return True
+
+
+def cache_push(repo):
+    """把 CACHE_DIR 打包上傳到 repo 的 Release，覆蓋舊的附件。失敗只警告，不影響評比結果的輸出。"""
+    t0 = time.time()
+    print(f"上傳快取：{repo} 的 release {CACHE_TAG} ...", file=sys.stderr)
+    with tempfile.TemporaryDirectory() as tmp:
+        path, n = os.path.join(tmp, CACHE_ASSET), 0
+        todo = [os.path.join(d, name) for d, _, files in os.walk(CACHE_DIR)
+                for name in files if name.endswith(".json")]   # 跳過寫到一半的 .tmp
+        total, done, tty = sum(os.path.getsize(f) for f in todo if os.path.exists(f)), 0, sys.stderr.isatty()
+        print(f"  打包 {len(todo)} 個檔案（{total / 1e6:.0f} MB）...", file=sys.stderr)
+        # tarfile 預設壓縮等級 9，幾 GB 的 JSON 要壓好幾分鐘；等級 6 快一倍左右，檔案只大一點
+        with tarfile.open(path, "w:gz", compresslevel=6) as tar:
+            for full in todo:
+                try:
+                    done += os.path.getsize(full)
+                    tar.add(full, arcname=os.path.relpath(full, CACHE_DIR)); n += 1
+                except OSError:
+                    pass
+                if tty and (n % 200 == 0 or n == len(todo)):
+                    print(f"\r  打包中 {n}/{len(todo)}（{100 * done // max(total, 1)}%）", end="", file=sys.stderr, flush=True)
+        if tty:
+            print(file=sys.stderr)
+        size = os.path.getsize(path)
+        if not n:
+            print("  快取是空的，沒有東西可以上傳", file=sys.stderr)
+            return False
+        if size >= CACHE_ASSET_MAX:
+            print(f"  壓縮後 {size / 1e9:.2f} GB，超過 Release 單一附件的上限，沒有上傳", file=sys.stderr)
+            return False
+        if _gh("release", "view", CACHE_TAG, "-R", repo).returncode:
+            # 標成 prerelease，才不會變成那個 repo 的「Latest release」
+            r = _gh("release", "create", CACHE_TAG, "-R", repo, "--prerelease", "--title", "gh_activity cache",
+                    "--notes", "gh_activity.py 的快取備份（--cache-push 自動上傳，每次覆蓋）。")
+            if r.returncode:
+                print(f"  建立 release 失敗：{_gh_error(r)[0]}", file=sys.stderr)
+                return False
+        print(f"  打包完成：{n} 個檔案、{size / 1e6:.1f} MB，{time.time() - t0:.1f}s。上傳中（gh 不回報進度，請稍候）...", file=sys.stderr)
+        t1 = time.time()
+        r = _gh("release", "upload", CACHE_TAG, path, "-R", repo, "--clobber")
+        if r.returncode:
+            print(f"  上傳失敗：{_gh_error(r)[0]}", file=sys.stderr)
+            return False
+    print(f"  上傳完成，{time.time() - t1:.1f}s", file=sys.stderr)
+    return True
 
 
 # ---- 計時與請求計數，只用來印在 stderr -----------------------------------------
@@ -1462,6 +1568,10 @@ def main():
                     help="另外替每個人寫一個 DIR/<帳號>.md：評分明細、區間內所有留言全文（含行內留言的 diff 片段）、本人開的 PR 的描述")
     ap.add_argument("--no-cache", action="store_true", help="不使用快取（ETag 和每個 PR 的原始資料都不用）")
     ap.add_argument("--cache-dir", help="快取目錄，預設 ~/.cache/gh_activity")
+    ap.add_argument("--cache-repo", metavar="OWNER/REPO",
+                    help=f"快取備份放在哪個 GitHub repo 的 Release（tag: cache），預設 {CACHE_REPO}。也可用環境變數 GH_ACTIVITY_CACHE_REPO")
+    ap.add_argument("--cache-pull", action="store_true", help="開跑前先從 --cache-repo 下載快取，和本機的合併")
+    ap.add_argument("--cache-push", action="store_true", help="抓完資料後把快取上傳到 --cache-repo")
     a = ap.parse_args()
     _cache_enabled = not a.no_cache
     if a.cache_dir:
@@ -1474,6 +1584,19 @@ def main():
         except OSError as e:
             print(f"警告：快取目錄 {CACHE_DIR} 無法寫入（{e.strerror}），這次不使用快取", file=sys.stderr)
             _cache_enabled = False
+
+    cache_repo = None
+    if a.cache_pull or a.cache_push:
+        if not _cache_enabled:
+            sys.exit("--cache-pull / --cache-push 不能和 --no-cache 一起用（或快取目錄無法寫入）")
+        cache_repo = normalize_repo(a.cache_repo or os.environ.get("GH_ACTIVITY_CACHE_REPO") or CACHE_REPO)
+        if a.cache_pull:
+            cache_pull(cache_repo)
+        if not (a.config or a.repo or a.user):
+            # 沒給評比對象：只做快取的拉 / 推就結束
+            if a.cache_push:
+                cache_push(cache_repo)
+            return
 
     if not TOKEN:
         sys.exit("未設定 GITHUB_TOKEN，每小時只有 60 次額度，跑不完。請 export GITHUB_TOKEN=... 後再執行。")
@@ -1534,6 +1657,8 @@ def main():
     for repo in skipped:
         repo_users.pop(repo)
     print(f"\n全部 {len(repo_users)} 個 repo 合計 {_elapsed(t_all, s_all)}\n", file=sys.stderr)
+    if a.cache_push:
+        cache_push(cache_repo)
 
     fetched = []
     for p in people:
