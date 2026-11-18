@@ -2,9 +2,11 @@
 # pr-review.sh
 # Fetch a GitHub PR, merge it (no commit) onto the latest base branch, and write
 # ONE markdown bundle for review:
-#   PR metadata + description, full discussion (comments, reviews, inline review
-#   threads), commit list, stat, full diff, and full contents of modified files.
-#   Nothing in the bundle is truncated.
+#   PR metadata + description, CI check results for the PR head, full discussion
+#   (comments, reviews, inline review threads with their resolved state), commit
+#   list, stat, full diff, and full contents of modified files.
+#   Only the diff context quoted under each inline thread is shortened (see
+#   HUNK_LINES); everything else is complete.
 #
 # Usage:
 #   pr-review.sh <pr-url> [base-branch]         # any GitHub repo, e.g.
@@ -20,7 +22,12 @@
 #   UPSTREAM      repo URL; derived from <pr-url>, default https://github.com/apache/kafka
 #   OUT_DIR       default $HOME/pr-review
 #   GITHUB_TOKEN  optional; falls back to `gh auth token`. Without a token the
-#                 GitHub API allows 60 requests/hour, which is enough for a few PRs.
+#                 GitHub API allows 60 requests/hour, which is enough for a few PRs,
+#                 but the resolved state of review threads is skipped (GraphQL
+#                 needs a token).
+#   HUNK_LINES    diff lines quoted under each inline thread; default 12, 0 = the
+#                 whole hunk as GitHub returns it
+#   GITHUB_API_URL  API root; default https://api.github.com
 #
 # Side effects (same as the manual workflow): the working tree is hard-reset,
 # untracked files are removed, <base-branch> is forced to match upstream, and
@@ -112,24 +119,30 @@ import json, os, sys, urllib.request
 
 slug, num = sys.argv[1], sys.argv[2]
 token = os.environ.get("GITHUB_TOKEN") or ""
-API = "https://api.github.com"
+API = os.environ.get("GITHUB_API_URL", "https://api.github.com").rstrip("/")
+HUNK_LINES = int(os.environ.get("HUNK_LINES", "12"))
 
-def get(path, paginate=False):
+def headers():
+    h = {"Accept": "application/vnd.github+json", "User-Agent": "pr-review.sh"}
+    if token:
+        h["Authorization"] = "Bearer " + token
+    return h
+
+def get(path, paginate=False, key=None):
+    """GET one object, or all pages of a list. `key` names the list inside a
+    wrapped response (check-runs returns {"check_runs": [...]})."""
     url = API + path
     if paginate:
         url += ("&" if "?" in url else "?") + "per_page=100"
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "pr-review.sh"}
-    if token:
-        headers["Authorization"] = "Bearer " + token
     out = []
     while url:
-        req = urllib.request.Request(url, headers=headers)
+        req = urllib.request.Request(url, headers=headers())
         with urllib.request.urlopen(req, timeout=30) as r:
             data = json.load(r)
             link = r.headers.get("Link", "") or ""
         if not paginate:
             return data
-        out.extend(data)
+        out.extend(data[key] if key else data)
         url = None
         for part in link.split(","):
             if 'rel="next"' in part:
@@ -139,6 +152,90 @@ def get(path, paginate=False):
 def text(body):
     body = (body or "").strip()
     return body if body else "_(no text)_"
+
+def thread_states():
+    """Root review-comment id -> True if the thread is resolved. The REST API
+    does not expose this, so ask GraphQL, which requires a token."""
+    if not token:
+        return None, "no GitHub token"
+    owner, name = slug.split("/", 1)
+    query = """query($o:String!,$n:String!,$p:Int!,$c:String){
+      repository(owner:$o,name:$n){pullRequest(number:$p){
+        reviewThreads(first:100,after:$c){
+          pageInfo{hasNextPage endCursor}
+          nodes{isResolved comments(first:1){nodes{databaseId}}}}}}}"""
+    states, cursor = {}, None
+    try:
+        while True:
+            body = json.dumps({"query": query, "variables":
+                               {"o": owner, "n": name, "p": int(num), "c": cursor}}).encode()
+            req = urllib.request.Request(API + "/graphql", data=body, headers=headers())
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.load(r)
+            if data.get("errors"):
+                return None, data["errors"][0].get("message", "GraphQL error")
+            page = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            for node in page["nodes"]:
+                first = node["comments"]["nodes"]
+                if first:
+                    states[first[0]["databaseId"]] = node["isResolved"]
+            if not page["pageInfo"]["hasNextPage"]:
+                return states, None
+            cursor = page["pageInfo"]["endCursor"]
+    except Exception as e:
+        return None, str(e)
+
+def ci_checks(sha):
+    """Check runs for the PR head: counts, then details of everything that is
+    not a plain pass, with failure annotations (these carry the failed tests)."""
+    print(f"## CI checks (PR head `{sha[:10]}`)\n")
+    try:
+        runs = get(f"/repos/{slug}/commits/{sha}/check-runs", True, "check_runs")
+    except Exception as e:
+        print(f"_(check runs request failed: {e})_\n")
+        return
+    if not runs:
+        print("_(no check runs reported for this commit)_\n")
+        return
+    def outcome(r):
+        return r.get("conclusion") or r.get("status") or "unknown"
+    counts = {}
+    for r in runs:
+        counts[outcome(r)] = counts.get(outcome(r), 0) + 1
+    print(", ".join(f"{n} {k}" for k, n in sorted(counts.items())) + "\n")
+    quiet = ("success", "skipped", "neutral")
+    passed = sorted(r["name"] for r in runs if outcome(r) == "success")
+    if passed:
+        print("Passed: " + ", ".join(passed) + "\n")
+    for r in sorted(runs, key=lambda r: r["name"]):
+        if outcome(r) in quiet:
+            continue
+        print(f"### {r['name']}: {outcome(r)}\n")
+        if r.get("html_url"):
+            print(r["html_url"] + "\n")
+        out = r.get("output") or {}
+        if (out.get("title") or "").strip():
+            print(f"**{out['title'].strip()}**\n")
+        if (out.get("summary") or "").strip():
+            print(out["summary"].strip() + "\n")
+        if outcome(r) != "failure" or not out.get("annotations_count"):
+            continue
+        try:
+            notes = get(f"/repos/{slug}/check-runs/{r['id']}/annotations", True)
+        except Exception as e:
+            print(f"_(annotations request failed: {e})_\n")
+            continue
+        for a in notes:
+            if a.get("annotation_level") != "failure":
+                continue
+            where = a.get("path") or ""
+            if where and a.get("start_line"):
+                where += f":{a['start_line']}"
+            head = " ".join(x for x in (a.get("title") or "", f"`{where}`" if where else "") if x)
+            print(f"- {head}".rstrip())
+            for line in (a.get("message") or "").strip().splitlines():
+                print(f"  {line}")
+        print()
 
 print("## PR description\n")
 try:
@@ -164,6 +261,8 @@ print()
 print(text(pr.get("body")))
 print()
 
+ci_checks(pr["head"]["sha"])
+
 # Build one chronological timeline: conversation comments, review verdicts,
 # and inline review threads (root comment + replies).
 events = []
@@ -188,9 +287,17 @@ for rc in roots:
     events.append((rc["created_at"], "thread", threads[rc["id"]]))
 events.sort(key=lambda e: e[0])
 
+resolved, why = (thread_states() if roots else ({}, None))
 print(f"## Discussion ({len(events)} items, chronological)\n")
 if not events:
     print("_(no comments yet)_\n")
+if resolved is None:
+    print(f"_(resolved state of inline threads unavailable: {why})_\n")
+elif roots:
+    still_open = sum(1 for rc in roots if resolved.get(rc["id"]) is False)
+    unknown = sum(1 for rc in roots if rc["id"] not in resolved)
+    note = f", {unknown} with unknown state" if unknown else ""
+    print(f"Inline threads: {len(roots)} total, {still_open} unresolved{note}.\n")
 for ts, kind, obj in events:
     if kind == "comment":
         print(f"### {obj['user']['login']} commented ({ts})\n")
@@ -205,11 +312,17 @@ for ts, kind, obj in events:
         root = obj[0]
         line = root.get("line") or root.get("original_line")
         outdated = " (outdated)" if root.get("line") is None else ""
-        print(f"### Inline thread: `{root['path']}` line {line}{outdated} ({ts})\n")
-        hunk = (root.get("diff_hunk") or "").rstrip("\n")
-        if hunk:
+        state = ""
+        if resolved is not None:
+            state = {True: " [resolved]", False: " [unresolved]"}.get(resolved.get(root["id"]), " [state unknown]")
+        print(f"### Inline thread: `{root['path']}` line {line}{outdated}{state} ({ts})\n")
+        hunk = (root.get("diff_hunk") or "").rstrip("\n").split("\n")
+        if hunk != [""]:
+            shown = hunk[-HUNK_LINES:] if 0 < HUNK_LINES < len(hunk) else hunk
+            if len(shown) < len(hunk):
+                print(f"_(last {len(shown)} of {len(hunk)} hunk lines; the comment is on the final line)_\n")
             print("````diff")
-            print(hunk)
+            print("\n".join(shown))
             print("````")
             print()
         for c in obj:
