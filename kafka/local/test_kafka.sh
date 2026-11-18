@@ -113,10 +113,11 @@ podman run --rm -it \
   -v "$GRADLE_USER_HOME":"$CONTAINER_GRADLE_HOME:O" \
   "$CUSTOM_IMAGE" \
   bash -c "
-    echo '🔄 正在建立獨立測試環境 (複製檔案中)...'
+    echo '🔄 正在建立獨立測試環境 (複製檔案中，略過 results)...'
     mkdir -p $CONTAINER_WORKDIR
-    # 加上 --no-preserve=ownership 避免容器內非 root 權限無法更改檔案擁有者
-    cp -a --no-preserve=ownership /source_ro/. $CONTAINER_WORKDIR/
+    # 用 tar 取代 cp 以便排除頂層的 results 目錄
+    # --no-same-owner 避免容器內非 root 權限無法更改檔案擁有者
+    tar -C /source_ro --exclude=./results -cf - . | tar -C $CONTAINER_WORKDIR --no-same-owner -xf -
     cd $CONTAINER_WORKDIR
 
     echo '✅ 環境準備完成！現在可以執行測試 (建議使用 ./gradlew test --no-daemon)'
