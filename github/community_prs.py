@@ -33,6 +33,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -41,7 +42,8 @@ from concurrent.futures import ThreadPoolExecutor
 CACHE_DIR = os.environ.get("COMMUNITY_PRS_CACHE") or os.path.join(os.path.expanduser("~"), ".cache", "community_prs")
 
 BATCH = 5           # authors per GraphQL request (bigger batches hit GitHub's 502 timeout)
-PER_AUTHOR = 50     # PRs per page per author; more pages are fetched when needed
+PER_AUTHOR = 20     # PRs per page per author; more pages are fetched when needed. GitHub bills a query by
+                    # this page size, not by what comes back, so keep it near what people really have
 WORKERS = 8         # concurrent requests
 RETRIES = 4
 TIMELINE = 30       # recent commits/reviews/comments per open PR, used to work out who the PR is waiting on
@@ -149,7 +151,7 @@ def build_query(authors, state, since, scope="", cursors=None, role="author", pe
       reviews(first: 1) {{ totalCount }}{mine}{timeline}
     }} }}
   }}''')
-    return "query {" + "".join(parts) + "\n}"
+    return "query {" + "".join(parts) + "\n  rateLimit { cost remaining resetAt }\n}"
 
 
 class Transient(Exception):
@@ -167,6 +169,11 @@ TOO_HEAVY = "Resource limits for this query exceeded"
 TRANSIENT = ("502", "503", "504", "timeout", "rate limit",
              "unexpected end of JSON input", "unexpected EOF", "invalid character",
              "connection reset", "stream error")
+
+
+# GraphQL rate-limit points spent by this run, taken from the rateLimit field of every response.
+QUOTA = {"requests": 0, "cost": 0, "remaining": None, "resetAt": None}
+QUOTA_LOCK = threading.Lock()
 
 
 def gh_graphql(query, retries=RETRIES):
@@ -194,6 +201,14 @@ def gh_graphql(query, retries=RETRIES):
             sys.exit(f"gh api failed:\n{r.stderr}")
         if data.get("errors"):
             sys.exit(f"GraphQL errors:\n{json.dumps(data['errors'], indent=2)}")
+        rl = data["data"].get("rateLimit")
+        if rl:
+            with QUOTA_LOCK:
+                QUOTA["requests"] += 1
+                QUOTA["cost"] += rl["cost"]
+                # requests run concurrently, so the lowest "remaining" seen is the latest one
+                if QUOTA["remaining"] is None or rl["remaining"] < QUOTA["remaining"]:
+                    QUOTA["remaining"], QUOTA["resetAt"] = rl["remaining"], rl["resetAt"]
         return data["data"]
 
 
@@ -244,6 +259,8 @@ def fetch(people, repos, state, since, all_repos=False, role="author"):
             result.update(out)
             done += len(out)
             print(f"fetched {done}/{len(people)} ({time.time() - t0:.0f}s)", file=sys.stderr)
+    print(f"rate limit: {QUOTA['requests']} requests cost {QUOTA['cost']} points, "
+          f"{QUOTA['remaining']} left until {QUOTA['resetAt']}", file=sys.stderr)
     if not all_repos:
         for login in result:
             result[login] = [p for p in result[login]
