@@ -1,6 +1,6 @@
 # 每 30 分鐘列出社群成員在各專案的 open PR，發佈到 GitHub Pages。
 # merged / reviews 是 30 天視窗，每 2 小時才重抓一次，其餘時候沿用線上的版本，省 GraphQL 額度
-# （GITHUB_TOKEN 每小時 1,000 點；每次 run 的用量印在 log 的 "rate limit:" 那行）。
+# （實測額度每小時 5,000 點：open 約 144 點，三頁全抓約 400 點；每次 run 的用量印在 log 的 "rate limit:" 那行）。
 # 一次性設定：repo Settings -> Pages -> Source 選 "GitHub Actions"。
 #   https://opensource4you.github.io/clip/             open PRs
 #   https://opensource4you.github.io/clip/merged.html  最近 30 天 merged
