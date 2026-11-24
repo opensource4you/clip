@@ -17,7 +17,7 @@ on:
         description: 分支、tag 或 commit SHA
         default: trunk
       test:
-        description: 要 loop 的測試：Class 或 Class.method（例如 ShareConsumerTest.testFoo），多個用空白或逗號分開。module 會自動找
+        description: 要 loop 的測試：Class、Class.method 或只填 method（例如 ShareConsumerTest.testFoo），多個用空白或逗號分開。module 會自動找
         required: true
       jdk:
         description: eclipse-temurin 映像檔 tag
@@ -66,7 +66,7 @@ jobs:
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
           [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 10 ]] || { echo "::error::parallel 要在 1..10"; exit 1; }
-          [[ "$TEST" =~ ^[A-Za-z0-9_.,\ ]*[A-Za-z0-9_][A-Za-z0-9_.,\ ]*$ ]] || { echo "::error::test 必填，只能有英數字、底線和點（Class 或 Class.method），多個用空白或逗號分開"; exit 1; }
+          [[ "$TEST" =~ ^[A-Za-z0-9_.,\ ]*[A-Za-z0-9_][A-Za-z0-9_.,\ ]*$ ]] || { echo "::error::test 必填，只能有英數字、底線和點（Class、Class.method 或 method），多個用空白或逗號分開"; exit 1; }
       - id: resolve
         name: Resolve command
         run: |
@@ -74,12 +74,19 @@ jobs:
           # test 可以填多個，用空白或逗號分開
           read -ra tests <<< "${TEST//,/ }"
 
-          # 只需要檔案清單和少數幾個檔案的內容，所以不抓 blob（--filter=blob:none），git show 時才去拿
+          # 平常只需要檔案清單和少數幾個檔案的內容，所以不抓 blob（--filter=blob:none），git show 時才去拿。
+          # 但只填 method 名稱（沒有 class）時要搜尋所有測試檔的內容，那就整個抓下來，不然 git grep 會一個一個檔案去拿
+          filter=(--filter=blob:none)
+          for t in "${tests[@]}"; do
+            [[ "$t" =~ (^|\.)[A-Z] ]] || filter=()
+          done
           git init -q src
           git -C src remote add origin "https://github.com/${ACCOUNT}/kafka"
-          git -C src config remote.origin.promisor true
-          git -C src config remote.origin.partialclonefilter blob:none
-          git -C src fetch -q --no-tags --depth=1 --filter=blob:none origin "+${REVISION}:tmp"
+          if [ "${#filter[@]}" -gt 0 ]; then
+            git -C src config remote.origin.promisor true
+            git -C src config remote.origin.partialclonefilter blob:none
+          fi
+          git -C src fetch -q --no-tags --depth=1 "${filter[@]}" origin "+${REVISION}:tmp"
           git -C src ls-tree -r --name-only tmp > tree.txt
 
           declare -A by_module=()
@@ -97,21 +104,37 @@ jobs:
                 break
               fi
             done
-            [ -n "$cls" ] || { echo "::error::找不到 class 名稱（要大寫開頭）：$t"; exit 1; }
 
-            if [ -n "$pkg" ]; then
-              re="/src/test/(java|scala)/${pkg}/${cls}\.(java|scala)$"
+            if [ -n "$cls" ]; then
+              if [ -n "$pkg" ]; then
+                re="/src/test/(java|scala)/${pkg}/${cls}\.(java|scala)$"
+              else
+                re="/src/test/(java|scala)/(.*/)?${cls}\.(java|scala)$"
+              fi
+              mapfile -t files < <(grep -E "$re" tree.txt || true)
+              if [ "${#files[@]}" -eq 0 ]; then
+                echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 class ${cls}"; exit 1
+              fi
+              if [ "${#files[@]}" -gt 1 ]; then
+                echo "::error::有 ${#files[@]} 個 ${cls}，請加上 package（例如 org.apache.kafka.foo.${cls}）"
+                printf '  %s\n' "${files[@]}"
+                exit 1
+              fi
             else
-              re="/src/test/(java|scala)/(.*/)?${cls}\.(java|scala)$"
-            fi
-            mapfile -t files < <(grep -E "$re" tree.txt || true)
-            if [ "${#files[@]}" -eq 0 ]; then
-              echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 class ${cls}"; exit 1
-            fi
-            if [ "${#files[@]}" -gt 1 ]; then
-              echo "::error::有 ${#files[@]} 個 ${cls}，請加上 package（例如 org.apache.kafka.foo.${cls}）"
-              printf '  %s\n' "${files[@]}"
-              exit 1
+              # 沒有 class，整個當成 method 名稱，找出宣告它的測試檔
+              [[ "$t" =~ ^[A-Za-z0-9_]+$ ]] || { echo "::error::看不懂「$t」：要填 Class、Class.method 或 method"; exit 1; }
+              method="$t"
+              mapfile -t files < <(git -C src grep -l -E "(void|def)[[:space:]]+${method}[[:space:]]*\(" tmp -- '*/src/test/java/*' '*/src/test/scala/*' | sed 's/^tmp://' || true)
+              if [ "${#files[@]}" -eq 0 ]; then
+                echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 method ${method}"; exit 1
+              fi
+              if [ "${#files[@]}" -gt 1 ]; then
+                echo "::error::有 ${#files[@]} 個檔案宣告了 ${method}，請改填 Class.${method}"
+                printf '  %s\n' "${files[@]}"
+                exit 1
+              fi
+              cls=$(basename "${files[0]}"); cls="${cls%.*}"
+              t="${cls}.${method}"
             fi
             file="${files[0]}"
             # clients/clients-integration-tests/src/test/... -> clients:clients-integration-tests
