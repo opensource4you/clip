@@ -377,6 +377,13 @@ def _request(url, headers, method="GET", body=None):
                 raise
 
 
+SLOW_RETRIES = 2   # GitHub 回 422「處理逾時」時原地重試幾次
+
+
+class SlowRequest(RuntimeError):
+    """GitHub 回 422 "The request is taking too long to process"，重試後仍然逾時。"""
+
+
 def get(url, params=None, accept="application/vnd.github+json"):
     """呼叫 API，處理 rate limit 與 ETag 快取，回傳 (json, next_url)。"""
     if params:
@@ -384,7 +391,7 @@ def get(url, params=None, accept="application/vnd.github+json"):
     headers = {"Accept": accept, "User-Agent": "gh-activity"}
     if TOKEN:
         headers["Authorization"] = f"Bearer {TOKEN}"
-    cached = None
+    cached, slow = None, 0
     if _cache_enabled and os.path.exists(_cache_path(url)):
         try:
             cached = json.load(open(_cache_path(url)))
@@ -417,6 +424,15 @@ def get(url, params=None, accept="application/vnd.github+json"):
         if w is not None:
             _wait(w)
             continue
+        if status == 422 and b"too long" in body:
+            # GitHub 後端逾時（"The request is taking too long to process"），多半是暫時的：重試幾次，
+            # 還是不行就丟 SlowRequest，讓呼叫端有機會把查詢切小再試
+            slow += 1
+            if slow <= SLOW_RETRIES:
+                print(f"  HTTP 422（GitHub 處理逾時），{5 * slow} 秒後重試（{slow}/{SLOW_RETRIES}）：{url}", file=sys.stderr)
+                _wait(5 * slow)
+                continue
+            raise SlowRequest(f"HTTP {status}: {url} {body[:200]!r}")
         print(f"  HTTP {status}: {url}", file=sys.stderr)
         raise RuntimeError(f"HTTP {status}: {url} {body[:200]!r}")
 
@@ -535,6 +551,31 @@ def get_all(url, params=None, key=None, accept="application/vnd.github+json"):
         data, nxt = get(nxt, accept=accept)
         out.extend(data[key] if key else data)
     return out
+
+
+def list_commits(repo, since, until):
+    """列出 repo 在 since ~ until（YYYY-MM-DD）之間 default branch 上的 commit，新的在前。
+    commit 多的 repo 翻到後面幾頁時，GitHub 可能回 422 處理逾時（翻頁越深越慢）。遇到就把時間區間對半拆開重抓，
+    每段都從第 1 頁翻起，深度變淺就過得了。拆到一小時以內還逾時才放棄那一段（只警告，不中斷）。"""
+    f = "%Y-%m-%dT%H:%M:%SZ"
+    todo, found = [(f"{since}T00:00:00Z", f"{until}T23:59:59Z")], {}
+    while todo:
+        s, u = todo.pop()
+        try:
+            rows = get_all(f"{API}/repos/{repo}/commits", {"since": s, "until": u})
+        except SlowRequest:
+            d0, d1 = datetime.strptime(s, f), datetime.strptime(u, f)
+            if d1 - d0 <= timedelta(hours=1):
+                print(f"  警告：{repo} 在 {s} ~ {u} 的 commit 一直逾時，略過這一段", file=sys.stderr)
+                continue
+            mid = d0 + timedelta(seconds=int((d1 - d0).total_seconds()) // 2)
+            print(f"  commits 逾時，把 {s} ~ {u} 對半拆開重抓", file=sys.stderr)
+            todo += [(s, mid.strftime(f)), ((mid + timedelta(seconds=1)).strftime(f), u)]
+            continue
+        for c in rows:
+            found.setdefault(c["sha"], c)
+    date = lambda c: ((c.get("commit") or {}).get("committer") or {}).get("date") or ""
+    return sorted(found.values(), key=date, reverse=True)
 
 
 def in_range(ts, since, until):
@@ -1099,7 +1140,7 @@ def analyze_repo(repo, users, since, until, jira_names=None, jira_project=None, 
     closed_by_commit = {}   # PR 編號 → 提到它的 commit（區間內、default branch）
     print("下載 commits ...", file=sys.stderr)
     t0, s0 = time.time(), _snapshot()
-    commits = get_all(f"{API}/repos/{repo}/commits", {"since": f"{since}T00:00:00Z", "until": f"{until}T23:59:59Z"})
+    commits = list_commits(repo, since, until)
     for c in commits:
         login = (c.get("author") or {}).get("login")
         if login in user_set:
