@@ -5,7 +5,7 @@
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-loop
-run-name: "loop ${{ inputs.account }}/${{ inputs.revision }}${{ inputs.test && format(' {0}', inputs.test) || '' }}${{ inputs.run_flaky && ' flaky' || '' }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
+run-name: "loop ${{ inputs.account }}/${{ inputs.revision }} ${{ inputs.test }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
 
 on:
   workflow_dispatch:
@@ -17,11 +17,8 @@ on:
         description: 分支、tag 或 commit SHA
         default: trunk
       test:
-        description: 要 loop 的測試（例如 ShareConsumerTest 或 ShareConsumerTest.testFoo）。有填就自動找出 module 並組出 Gradle 指令，下面的 command 會被忽略
-        default: ""
-      command:
-        description: Gradle 指令，test 沒填時才會用（./gradlew 開頭，只能有 task、--tests、-x、-Pkey=value 和常用 flag）
-        default: ./gradlew clean metadata:test
+        description: 要 loop 的測試：Class 或 Class.method（例如 ShareConsumerTest.testFoo），多個用空白或逗號分開。module 會自動找
+        required: true
       jdk:
         description: eclipse-temurin 映像檔 tag
         type: choice
@@ -40,10 +37,6 @@ on:
         type: choice
         options: [github, community-vm]
         default: github
-      run_flaky:
-        description: 只跑標了 @Flaky 的測試（自動加 -Pkafka.test.run.flaky=true）。要 loop 的測試有 @Flaky 就要勾，不然它會被跳過、看起來全部通過。test 欄位填到 method（Class.method）而且是 Java 測試時會自動判斷，不用勾
-        type: boolean
-        default: false
 
 permissions:
   contents: read
@@ -54,7 +47,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       ids: ${{ steps.ids.outputs.ids }}
-      # 實際要跑的指令和 flaky 設定：test 有填時是這裡組出來的，不是 inputs 的原值
+      # 實際要跑的 Gradle 指令，以及要不要帶 -Pkafka.test.run.flaky=true，都由 test 欄位解析出來
       command: ${{ steps.resolve.outputs.command }}
       run_flaky: ${{ steps.resolve.outputs.run_flaky }}
     env:
@@ -62,9 +55,7 @@ jobs:
       REVISION: ${{ inputs.revision }}
       LOOPS: ${{ inputs.loops }}
       PARALLEL: ${{ inputs.parallel }}
-      COMMAND: ${{ inputs.command }}
       TEST: ${{ inputs.test }}
-      RUN_FLAKY: ${{ inputs.run_flaky }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -75,15 +66,28 @@ jobs:
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
           [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 10 ]] || { echo "::error::parallel 要在 1..10"; exit 1; }
-          [[ -z "$TEST" || "$TEST" =~ ^[A-Za-z0-9_.]+$ ]] || { echo "::error::test 只能有英數字、底線和點（Class 或 Class.method）"; exit 1; }
+          [[ "$TEST" =~ ^[A-Za-z0-9_.,\ ]*[A-Za-z0-9_][A-Za-z0-9_.,\ ]*$ ]] || { echo "::error::test 必填，只能有英數字、底線和點（Class 或 Class.method），多個用空白或逗號分開"; exit 1; }
       - id: resolve
         name: Resolve command
         run: |
           set -euo pipefail
-          flaky="$RUN_FLAKY"
-          if [ -n "$TEST" ]; then
+          # test 可以填多個，用空白或逗號分開
+          read -ra tests <<< "${TEST//,/ }"
+
+          # 只需要檔案清單和少數幾個檔案的內容，所以不抓 blob（--filter=blob:none），git show 時才去拿
+          git init -q src
+          git -C src remote add origin "https://github.com/${ACCOUNT}/kafka"
+          git -C src config remote.origin.promisor true
+          git -C src config remote.origin.partialclonefilter blob:none
+          git -C src fetch -q --no-tags --depth=1 --filter=blob:none origin "+${REVISION}:tmp"
+          git -C src ls-tree -r --name-only tmp > tree.txt
+
+          declare -A by_module=()
+          modules=()
+          flaky_yes=() flaky_no=()
+          for t in "${tests[@]}"; do
             # 第一個大寫開頭的段落當 class，前面是 package（可省略），後面是 method（可省略）
-            IFS=. read -ra parts <<< "$TEST"
+            IFS=. read -ra parts <<< "$t"
             cls=""; pkg=""; method=""
             for idx in "${!parts[@]}"; do
               if [[ "${parts[$idx]}" =~ ^[A-Z] ]]; then
@@ -93,26 +97,19 @@ jobs:
                 break
               fi
             done
-            [ -n "$cls" ] || { echo "::error::test 裡找不到 class 名稱（要大寫開頭）：$TEST"; exit 1; }
-
-            # 只需要檔案清單和一個檔案的內容，所以不抓 blob（--filter=blob:none），git show 時才去拿那一個
-            git init -q src
-            git -C src remote add origin "https://github.com/${ACCOUNT}/kafka"
-            git -C src config remote.origin.promisor true
-            git -C src config remote.origin.partialclonefilter blob:none
-            git -C src fetch -q --no-tags --depth=1 --filter=blob:none origin "+${REVISION}:tmp"
+            [ -n "$cls" ] || { echo "::error::找不到 class 名稱（要大寫開頭）：$t"; exit 1; }
 
             if [ -n "$pkg" ]; then
               re="/src/test/(java|scala)/${pkg}/${cls}\.(java|scala)$"
             else
               re="/src/test/(java|scala)/(.*/)?${cls}\.(java|scala)$"
             fi
-            mapfile -t files < <(git -C src ls-tree -r --name-only tmp | grep -E "$re" || true)
+            mapfile -t files < <(grep -E "$re" tree.txt || true)
             if [ "${#files[@]}" -eq 0 ]; then
               echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 class ${cls}"; exit 1
             fi
             if [ "${#files[@]}" -gt 1 ]; then
-              echo "::error::有 ${#files[@]} 個 ${cls}，請在 test 加上 package（例如 org.apache.kafka.foo.${cls}）或改用 command"
+              echo "::error::有 ${#files[@]} 個 ${cls}，請加上 package（例如 org.apache.kafka.foo.${cls}）"
               printf '  %s\n' "${files[@]}"
               exit 1
             fi
@@ -120,26 +117,47 @@ jobs:
             # clients/clients-integration-tests/src/test/... -> clients:clients-integration-tests
             dir="${file%%/src/test/*}"
             module="${dir//\//:}"
-            COMMAND="./gradlew clean ${module}:test --tests ${TEST}"
+            [ -n "${by_module[$module]:-}" ] || modules+=("$module")
+            by_module[$module]+=" --tests $t"
+            echo "::notice::${t} 在 ${file}"
 
-            # 指定到 method 的 Java 測試：看它前面的 annotation 有沒有 @Flaky，有的話一定要帶 flaky 屬性才跑得到。
-            # 一般敘述以 ; 結尾、annotation 不會，所以碰到 ; 就代表前一個 method 的 annotation 區段結束了
-            if [ "$flaky" != true ] && [ -n "$method" ] && [[ "$file" == *.java ]]; then
-              git -C src show "tmp:$file" > test-source.txt
-              detected=$(awk -v m="$method" '
-                /@Flaky/ { f = 1 }
-                $0 ~ ("void[ \t]+" m "[ \t]*\\(") { print (f ? "true" : "false"); exit }
-                /;[ \t]*$/ { f = 0 }
-              ' test-source.txt)
-              if [ -z "$detected" ]; then
-                echo "::warning::在 ${file} 找不到 method ${method}，照原樣交給 Gradle"
-              elif [ "$detected" = true ]; then
-                flaky=true
-                echo "::notice::${cls}.${method} 有 @Flaky，自動加上 -Pkafka.test.run.flaky=true"
+            # Kafka 預設跳過 @Flaky 的測試，帶 -Pkafka.test.run.flaky=true 則「只跑」@Flaky 的，所以要先知道這個測試有沒有標。
+            # @Flaky 可以標在 class（整個 class 都算）或 method 上。判斷方式：@Flaky 出現後、下一個敘述結束前碰到的宣告就是它標的對象。
+            # Java 的敘述以 ; 結尾（annotation 不會）；Scala 沒有 ;，改用單獨一行的 } 和 import/package 當分界
+            git -C src show "tmp:$file" > test-source.txt
+            scala=0; [[ "$file" == *.scala ]] && scala=1
+            read -r class_flaky method_flaky method_found total < <(awk -v cls="$cls" -v m="$method" -v scala="$scala" '
+              /@Flaky/ { f = 1; total++ }
+              !seen && $0 ~ ("(class|object)[ \t]+" cls "([^A-Za-z0-9_]|$)") { seen = 1; if (f) cf = 1; f = 0; next }
+              m != "" && $0 ~ ("(void|def)[ \t]+" m "[ \t]*\\(") { found = 1; if (f) mf = 1 }
+              /;[ \t]*$/ || /^(import|package)[ \t]/ || (scala && /^[ \t]*}[ \t]*$/) { f = 0 }
+              END { print cf + 0, mf + 0, found + 0, total + 0 }
+            ' test-source.txt)
+            if [ "$class_flaky" = 1 ] || [ "$method_flaky" = 1 ]; then
+              flaky_yes+=("$t")
+            else
+              flaky_no+=("$t")
+              if [ -n "$method" ] && [ "$method_found" = 0 ]; then
+                echo "::warning::在 ${file} 找不到 method ${method}（可能定義在父類別），當作沒有 @Flaky"
+              elif [ -z "$method" ] && [ "$total" -gt 0 ]; then
+                echo "::warning::${cls} 裡有 ${total} 個標了 @Flaky 的測試，這次不會跑到；要跑它們請填 ${cls}.method"
               fi
             fi
-            echo "::notice::${TEST} 在 ${file}，指令：${COMMAND}"
+          done
+
+          flaky=false
+          if [ "${#flaky_yes[@]}" -gt 0 ]; then
+            # flaky 屬性是「只跑 @Flaky」，所以有標和沒標的不能放在同一次
+            if [ "${#flaky_no[@]}" -gt 0 ]; then
+              echo "::error::有 @Flaky 的（${flaky_yes[*]}）和沒有的（${flaky_no[*]}）不能一起跑，請分兩次"; exit 1
+            fi
+            flaky=true
+            echo "::notice::${flaky_yes[*]} 有 @Flaky，自動加上 -Pkafka.test.run.flaky=true"
           fi
+
+          COMMAND="./gradlew clean"
+          for m in "${modules[@]}"; do COMMAND+=" ${m}:test${by_module[$m]}"; done
+          echo "::notice::指令：${COMMAND}"
           bash kafka/ci/check_gradle_command.sh "$COMMAND"
           echo "command=$COMMAND" >> "$GITHUB_OUTPUT"
           echo "run_flaky=$flaky" >> "$GITHUB_OUTPUT"
