@@ -5,7 +5,7 @@
 # Runner 設定見 .github/self-hosted-runner.md
 
 name: kafka-loop
-run-name: "loop ${{ inputs.account }}/${{ inputs.revision }}${{ inputs.run_flaky && ' flaky' || '' }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
+run-name: "loop ${{ inputs.account }}/${{ inputs.revision }}${{ inputs.test && format(' {0}', inputs.test) || '' }}${{ inputs.run_flaky && ' flaky' || '' }} x${{ inputs.loops }} (${{ inputs.jdk }}, ${{ inputs.runner }})"
 
 on:
   workflow_dispatch:
@@ -16,8 +16,11 @@ on:
       revision:
         description: 分支、tag 或 commit SHA
         default: trunk
+      test:
+        description: 要 loop 的測試（例如 ShareConsumerTest 或 ShareConsumerTest.testFoo）。有填就自動找出 module 並組出 Gradle 指令，下面的 command 會被忽略
+        default: ""
       command:
-        description: Gradle 指令（./gradlew 開頭，只能有 task、--tests、-x、-Pkey=value 和常用 flag）
+        description: Gradle 指令，test 沒填時才會用（./gradlew 開頭，只能有 task、--tests、-x、-Pkey=value 和常用 flag）
         default: ./gradlew clean metadata:test
       jdk:
         description: eclipse-temurin 映像檔 tag
@@ -38,7 +41,7 @@ on:
         options: [github, community-vm]
         default: github
       run_flaky:
-        description: 只跑標了 @Flaky 的測試（自動加 -Pkafka.test.run.flaky=true）。要 loop 的測試有 @Flaky 就要勾，不然它會被跳過、看起來全部通過
+        description: 只跑標了 @Flaky 的測試（自動加 -Pkafka.test.run.flaky=true）。要 loop 的測試有 @Flaky 就要勾，不然它會被跳過、看起來全部通過。test 欄位填到 method（Class.method）而且是 Java 測試時會自動判斷，不用勾
         type: boolean
         default: false
 
@@ -51,23 +54,95 @@ jobs:
     timeout-minutes: 5
     outputs:
       ids: ${{ steps.ids.outputs.ids }}
+      # 實際要跑的指令和 flaky 設定：test 有填時是這裡組出來的，不是 inputs 的原值
+      command: ${{ steps.resolve.outputs.command }}
+      run_flaky: ${{ steps.resolve.outputs.run_flaky }}
     env:
       ACCOUNT: ${{ inputs.account }}
       REVISION: ${{ inputs.revision }}
       LOOPS: ${{ inputs.loops }}
       PARALLEL: ${{ inputs.parallel }}
       COMMAND: ${{ inputs.command }}
+      TEST: ${{ inputs.test }}
+      RUN_FLAKY: ${{ inputs.run_flaky }}
     steps:
       - uses: actions/checkout@v7
         with:
           sparse-checkout: kafka
       - name: Validate inputs
         run: |
-          bash kafka/ci/check_gradle_command.sh "$COMMAND"
           [[ "$ACCOUNT" =~ ^[A-Za-z0-9-]+$ ]] || { echo "::error::bad account"; exit 1; }
           [[ "$REVISION" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad revision"; exit 1; }
           [[ "$LOOPS" =~ ^[0-9]+$ && "$LOOPS" -ge 1 && "$LOOPS" -le 200 ]] || { echo "::error::loops 要在 1..200"; exit 1; }
           [[ "$PARALLEL" =~ ^[0-9]+$ && "$PARALLEL" -ge 1 && "$PARALLEL" -le 10 ]] || { echo "::error::parallel 要在 1..10"; exit 1; }
+          [[ -z "$TEST" || "$TEST" =~ ^[A-Za-z0-9_.]+$ ]] || { echo "::error::test 只能有英數字、底線和點（Class 或 Class.method）"; exit 1; }
+      - id: resolve
+        name: Resolve command
+        run: |
+          set -euo pipefail
+          flaky="$RUN_FLAKY"
+          if [ -n "$TEST" ]; then
+            # 第一個大寫開頭的段落當 class，前面是 package（可省略），後面是 method（可省略）
+            IFS=. read -ra parts <<< "$TEST"
+            cls=""; pkg=""; method=""
+            for idx in "${!parts[@]}"; do
+              if [[ "${parts[$idx]}" =~ ^[A-Z] ]]; then
+                cls="${parts[$idx]}"
+                pkg=$(IFS=/; echo "${parts[*]:0:$idx}")
+                method="${parts[$((idx + 1))]:-}"
+                break
+              fi
+            done
+            [ -n "$cls" ] || { echo "::error::test 裡找不到 class 名稱（要大寫開頭）：$TEST"; exit 1; }
+
+            # 只需要檔案清單和一個檔案的內容，所以不抓 blob（--filter=blob:none），git show 時才去拿那一個
+            git init -q src
+            git -C src remote add origin "https://github.com/${ACCOUNT}/kafka"
+            git -C src config remote.origin.promisor true
+            git -C src config remote.origin.partialclonefilter blob:none
+            git -C src fetch -q --no-tags --depth=1 --filter=blob:none origin "+${REVISION}:tmp"
+
+            if [ -n "$pkg" ]; then
+              re="/src/test/(java|scala)/${pkg}/${cls}\.(java|scala)$"
+            else
+              re="/src/test/(java|scala)/(.*/)?${cls}\.(java|scala)$"
+            fi
+            mapfile -t files < <(git -C src ls-tree -r --name-only tmp | grep -E "$re" || true)
+            if [ "${#files[@]}" -eq 0 ]; then
+              echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 class ${cls}"; exit 1
+            fi
+            if [ "${#files[@]}" -gt 1 ]; then
+              echo "::error::有 ${#files[@]} 個 ${cls}，請在 test 加上 package（例如 org.apache.kafka.foo.${cls}）或改用 command"
+              printf '  %s\n' "${files[@]}"
+              exit 1
+            fi
+            file="${files[0]}"
+            # clients/clients-integration-tests/src/test/... -> clients:clients-integration-tests
+            dir="${file%%/src/test/*}"
+            module="${dir//\//:}"
+            COMMAND="./gradlew clean ${module}:test --tests ${TEST}"
+
+            # 指定到 method 的 Java 測試：看它前面的 annotation 有沒有 @Flaky，有的話一定要帶 flaky 屬性才跑得到。
+            # 一般敘述以 ; 結尾、annotation 不會，所以碰到 ; 就代表前一個 method 的 annotation 區段結束了
+            if [ "$flaky" != true ] && [ -n "$method" ] && [[ "$file" == *.java ]]; then
+              git -C src show "tmp:$file" > test-source.txt
+              detected=$(awk -v m="$method" '
+                /@Flaky/ { f = 1 }
+                $0 ~ ("void[ \t]+" m "[ \t]*\\(") { print (f ? "true" : "false"); exit }
+                /;[ \t]*$/ { f = 0 }
+              ' test-source.txt)
+              if [ -z "$detected" ]; then
+                echo "::warning::在 ${file} 找不到 method ${method}，照原樣交給 Gradle"
+              elif [ "$detected" = true ]; then
+                flaky=true
+                echo "::notice::${cls}.${method} 有 @Flaky，自動加上 -Pkafka.test.run.flaky=true"
+              fi
+            fi
+            echo "::notice::${TEST} 在 ${file}，指令：${COMMAND}"
+          fi
+          bash kafka/ci/check_gradle_command.sh "$COMMAND"
+          echo "command=$COMMAND" >> "$GITHUB_OUTPUT"
+          echo "run_flaky=$flaky" >> "$GITHUB_OUTPUT"
       - id: ids
         run: echo "ids=$(seq -s, 1 "$PARALLEL" | sed 's/.*/[&]/')" >> "$GITHUB_OUTPUT"
 
@@ -85,8 +160,8 @@ jobs:
     env:
       ACCOUNT: ${{ inputs.account }}
       REVISION: ${{ inputs.revision }}
-      COMMAND: ${{ inputs.command }}
-      RUN_FLAKY: ${{ inputs.run_flaky }}
+      COMMAND: ${{ needs.setup.outputs.command }}
+      RUN_FLAKY: ${{ needs.setup.outputs.run_flaky }}
       LOOPS: ${{ inputs.loops }}
       IMAGE: docker.io/library/eclipse-temurin:${{ inputs.jdk }}
       GRADLE_CACHE_DIR: ${{ github.workspace }}/../.gradle-cache/c${{ matrix.id }}-${{ inputs.jdk }}
@@ -204,7 +279,7 @@ jobs:
           retention-days: 14
 
   report:
-    needs: loop
+    needs: [setup, loop]
     if: always() && needs.loop.result != 'skipped'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -217,8 +292,8 @@ jobs:
         env:
           ACCOUNT: ${{ inputs.account }}
           REVISION: ${{ inputs.revision }}
-          COMMAND: ${{ inputs.command }}
-          RUN_FLAKY: ${{ inputs.run_flaky }}
+          COMMAND: ${{ needs.setup.outputs.command }}
+          RUN_FLAKY: ${{ needs.setup.outputs.run_flaky }}
           JDK: ${{ inputs.jdk }}
         run: |
           python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
