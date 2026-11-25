@@ -490,7 +490,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name="", ro
                     flags.append('<span class="fl conflict" title="has merge conflicts, needs rebase">⚠ conflict</span>'); ftext.append("conflict")
             conflict = int(p.get("mergeable") == "CONFLICTING" and p["state"] == "OPEN")
             days = took(p)
-            byline, mv, ncol = "", "", f'<td class="n">{p["comments"]["totalCount"]}</td>'
+            byline, mv, todo, ncol = "", "", 0, f'<td class="n">{p["comments"]["totalCount"]}</td>'
             if revmode:
                 subs = mine[p["url"]]
                 mv = verdict(subs)
@@ -498,6 +498,12 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name="", ro
                     vtext, vcls, vword = VERDICT.get(mv, (mv.lower(), "mv-c", mv.lower()))
                     flags.insert(0, f'<span class="fl mv {vcls}" title="their standing review on this PR; click to show only these">{e(vtext)}</span>')
                     ftext.append(vword)
+                # still open and not approved by this reviewer: the PRs they may still owe a look,
+                # whatever the PR's overall status says (others may already have approved it)
+                todo = int(p["state"] == "OPEN" and not p["isDraft"] and mv != "APPROVED")
+                if todo:
+                    flags.append('<span class="fl todo" title="still open and not approved by them; click to show only these">● pending</span>')
+                    ftext.append("pending")
                 pa = (p.get("author") or {}).get("login") or "ghost"
                 byline = f'<span class="by">by <a href="https://github.com/{e(pa)}" target="_blank">{e(pa)}</a></span> '
                 ftext.append(pa)
@@ -512,7 +518,7 @@ def render(result, repos, state, since, dispatch=None, nav=None, out_name="", ro
                 end = p.get("mergedAt") or p["updatedAt"]
                 tail = f'<td class="n">{days}d</td><td class="n">{days_ago(end)}d</td>'
             body.append(
-                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" data-mine="{mv}" '
+                f'<tr class="pr" data-login="{e(login)}" data-repo="{e(repo)}" data-status="{e(lab)}" data-stale="{int(stale)}" data-conflict="{conflict}" data-days="{days}" data-mine="{mv}" data-todo="{todo}" '
                 f'data-text="{e(login)} {e(repo)} {e(p["title"])} {e(lab)} {e(" ".join(ftext))}">'
                 f'<td class="repo">{e(repo.split("/")[-1])}</td>'
                 f'<td class="num"><a href="{e(p["url"])}" target="_blank">#{p["number"]}</a></td>'
@@ -576,7 +582,8 @@ tr.grp{{scroll-margin-top:var(--thead-h,37px)}}
 .summary{{width:100%}} .summary td:nth-child(n+2),.summary th:nth-child(n+2){{text-align:right}}
 .summary th{{cursor:pointer;user-select:none;white-space:nowrap}} .summary th:hover{{background:var(--head-hover)}} .summary th.on::after{{content:" ↓";color:var(--muted)}} .summary th.on.asc::after{{content:" ↑"}}
 #count{{color:var(--muted)}}
-.prs .st,.prs .mv{{cursor:pointer}} .prs .st:hover,.prs .mv:hover{{text-decoration:underline}}
+.prs .st,.prs .mv,.prs .todo{{cursor:pointer}} .prs .st:hover,.prs .mv:hover,.prs .todo:hover{{text-decoration:underline}}
+.todo{{color:var(--info-fg)}}
 #fchip{{margin:0 0 10px;font-size:12px}} #fchip[hidden]{{display:none}}
 #fchip button{{font:inherit;padding:1px 4px 1px 8px;cursor:pointer;background:var(--info-bg);color:var(--info-fg);border:0;border-radius:10px}}
 .mrepo{{display:none}}
@@ -669,7 +676,7 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
     curLogin=null; if(thead) spy();   // the list was rebuilt: re-mark who is on screen
   }}
   try{{var saved=localStorage.getItem('cprs.repo');if(saved&&sel.querySelector('option[value="'+saved+'"]'))sel.value=saved;}}catch(e){{}}
-  // click a status badge (or a reviewer's verdict) to show only PRs with the same one; click again to clear
+  // click a status badge (or a reviewer's verdict, or "pending") to show only PRs with the same one; click again to clear
   var fst=null, chip=document.getElementById('fchip');
   function setStatus(f){{
     fst=f; chip.hidden=!f;
@@ -678,8 +685,10 @@ nav.pages{{margin:0 0 10px;font-size:14px}} nav.pages b{{padding:2px 8px;backgro
   }}
   chip.addEventListener('click',function(){{setStatus(null);}});
   document.querySelector('.prs').addEventListener('click',function(ev){{
-    var b=ev.target.closest('.st,.mv'), r=b&&b.closest('tr.pr'); if(!r) return;
-    var f=b.classList.contains('mv')?{{k:'mine',v:r.dataset.mine,label:b.textContent}}:{{k:'status',v:r.dataset.status,label:b.textContent}};
+    var b=ev.target.closest('.st,.mv,.todo'), r=b&&b.closest('tr.pr'); if(!r) return;
+    var f=b.classList.contains('todo')?{{k:'todo',v:'1',label:b.textContent}}
+         :b.classList.contains('mv')?{{k:'mine',v:r.dataset.mine,label:b.textContent}}
+         :{{k:'status',v:r.dataset.status,label:b.textContent}};
     setStatus(fst&&fst.k===f.k&&fst.v===f.v?null:f);
     r.scrollIntoView({{block:'nearest'}});
   }});
