@@ -1,4 +1,4 @@
-gi# kafka/
+# kafka/
 
 ## ci/ — GitHub Actions 用（`.github/workflows/kafka-*.yml`）
 
@@ -13,7 +13,7 @@ gi# kafka/
 
 | 檔案 | 用途 |
 |---|---|
-| `test-kafka.sh` | 用 Podman 把 Kafka 原始碼複製進容器跑測試，不動本機目錄 |
+| `test-kafka.sh` | 用 Podman 把 Kafka 原始碼複製進容器跑測試，不動本機目錄；`-t` 只給測試名稱就能跑，`-p`、`-r` 可同時開多個容器重複跑，驗證測試是否穩定 |
 | `start_kafka_dist.sh` | 從 release tarball 在本機起 KRaft cluster（多 controller / broker） |
 | `scan_cve.sh` | 從任一 git ref 建 release tarball，用 grype 掃 `libs/` |
 | `find_slow_tests.py` | 讀 JUnit XML，列出最慢的測試方法 |

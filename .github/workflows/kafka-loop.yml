@@ -17,7 +17,7 @@ on:
         description: 分支、tag 或 commit SHA
         default: trunk
       test:
-        description: 要 loop 的測試：Class、Class.method 或只填 method（例如 ShareConsumerTest.testFoo），多個用空白或逗號分開。module 會自動找
+        description: 要 loop 的測試：Class、Class.method 或只填 method（例如 ShareConsumerTest.testFoo），多個用空白或逗號分開。module 會自動找，名稱對應到多個檔案時全部都跑
         required: true
       jdk:
         description: eclipse-temurin 映像檔 tag
@@ -115,10 +115,11 @@ jobs:
               if [ "${#files[@]}" -eq 0 ]; then
                 echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 class ${cls}"; exit 1
               fi
-              if [ "${#files[@]}" -gt 1 ]; then
-                echo "::error::有 ${#files[@]} 個 ${cls}，請加上 package（例如 org.apache.kafka.foo.${cls}）"
-                printf '  %s\n' "${files[@]}"
-                exit 1
+              # 同名的 class 有好幾個時，指定了 method 就只留有宣告該 method 的檔案
+              # （都沒有的話可能定義在父類別，全部保留）；其餘情況全部都跑
+              if [ "${#files[@]}" -gt 1 ] && [ -n "$method" ]; then
+                mapfile -t declaring < <(git -C src grep -l -E "(void|def)[[:space:]]+${method}[[:space:]]*\(" tmp -- "${files[@]}" | sed 's/^tmp://' || true)
+                if [ "${#declaring[@]}" -gt 0 ]; then files=("${declaring[@]}"); fi
               fi
             else
               # 沒有 class，整個當成 method 名稱，找出宣告它的測試檔
@@ -128,44 +129,48 @@ jobs:
               if [ "${#files[@]}" -eq 0 ]; then
                 echo "::error::在 ${ACCOUNT}/kafka@${REVISION} 找不到測試 method ${method}"; exit 1
               fi
-              if [ "${#files[@]}" -gt 1 ]; then
-                echo "::error::有 ${#files[@]} 個檔案宣告了 ${method}，請改填 Class.${method}"
-                printf '  %s\n' "${files[@]}"
-                exit 1
-              fi
-              cls=$(basename "${files[0]}"); cls="${cls%.*}"
-              t="${cls}.${method}"
             fi
-            file="${files[0]}"
-            # clients/clients-integration-tests/src/test/... -> clients:clients-integration-tests
-            dir="${file%%/src/test/*}"
-            module="${dir//\//:}"
-            [ -n "${by_module[$module]:-}" ] || modules+=("$module")
-            by_module[$module]+=" --tests $t"
-            echo "::notice::${t} 在 ${file}"
+            if [ "${#files[@]}" -gt 1 ]; then
+              echo "::notice::${t} 對應到 ${#files[@]} 個檔案，全部都跑（只想跑其中一個請加上 package 或 class）"
+            fi
+            bare_method=false
+            if [ -z "$cls" ]; then bare_method=true; fi
+            for file in "${files[@]}"; do
+              if [ "$bare_method" = true ]; then
+                cls=$(basename "$file"); cls="${cls%.*}"
+                t="${cls}.${method}"
+              fi
+              # clients/clients-integration-tests/src/test/... -> clients:clients-integration-tests
+              dir="${file%%/src/test/*}"
+              module="${dir//\//:}"
+              [ -n "${by_module[$module]:-}" ] || modules+=("$module")
+              # 同一個 module 裡同名的 class 用同一個 --tests 就涵蓋了，不要重複加
+              if [[ " ${by_module[$module]:-} " != *" --tests $t "* ]]; then by_module[$module]+=" --tests $t"; fi
+              echo "::notice::${t} 在 ${file}"
 
-            # Kafka 預設跳過 @Flaky 的測試，帶 -Pkafka.test.run.flaky=true 則「只跑」@Flaky 的，所以要先知道這個測試有沒有標。
-            # @Flaky 可以標在 class（整個 class 都算）或 method 上。判斷方式：@Flaky 出現後、下一個敘述結束前碰到的宣告就是它標的對象。
-            # Java 的敘述以 ; 結尾（annotation 不會）；Scala 沒有 ;，改用單獨一行的 } 和 import/package 當分界
-            git -C src show "tmp:$file" > test-source.txt
-            scala=0; [[ "$file" == *.scala ]] && scala=1
-            read -r class_flaky method_flaky method_found total < <(awk -v cls="$cls" -v m="$method" -v scala="$scala" '
-              /@Flaky/ { f = 1; total++ }
-              !seen && $0 ~ ("(class|object)[ \t]+" cls "([^A-Za-z0-9_]|$)") { seen = 1; if (f) cf = 1; f = 0; next }
-              m != "" && $0 ~ ("(void|def)[ \t]+" m "[ \t]*\\(") { found = 1; if (f) mf = 1 }
-              /;[ \t]*$/ || /^(import|package)[ \t]/ || (scala && /^[ \t]*}[ \t]*$/) { f = 0 }
-              END { print cf + 0, mf + 0, found + 0, total + 0 }
-            ' test-source.txt)
-            if [ "$class_flaky" = 1 ] || [ "$method_flaky" = 1 ]; then
-              flaky_yes+=("$t")
-            else
-              flaky_no+=("$t")
-              if [ -n "$method" ] && [ "$method_found" = 0 ]; then
-                echo "::warning::在 ${file} 找不到 method ${method}（可能定義在父類別），當作沒有 @Flaky"
-              elif [ -z "$method" ] && [ "$total" -gt 0 ]; then
-                echo "::warning::${cls} 裡有 ${total} 個標了 @Flaky 的測試，這次不會跑到；要跑它們請填 ${cls}.method"
+              # Kafka 預設跳過 @Flaky 的測試，帶 -Pkafka.test.run.flaky=true 則「只跑」@Flaky 的，所以要先知道這個測試有沒有標。
+              # @Flaky 可以標在 class（整個 class 都算）或 method 上。判斷方式：@Flaky 出現後、下一個敘述結束前碰到的宣告就是它標的對象。
+              # Java 的敘述以 ; 結尾（annotation 不會）；Scala 沒有 ;，改用單獨一行的 } 和 import/package 當分界
+              git -C src show "tmp:$file" > test-source.txt
+              scala=0; [[ "$file" == *.scala ]] && scala=1
+              read -r class_flaky method_flaky method_found total < <(awk -v cls="$cls" -v m="$method" -v scala="$scala" '
+                /@Flaky/ { f = 1; total++ }
+                !seen && $0 ~ ("(class|object)[ \t]+" cls "([^A-Za-z0-9_]|$)") { seen = 1; if (f) cf = 1; f = 0; next }
+                m != "" && $0 ~ ("(void|def)[ \t]+" m "[ \t]*\\(") { found = 1; if (f) mf = 1 }
+                /;[ \t]*$/ || /^(import|package)[ \t]/ || (scala && /^[ \t]*}[ \t]*$/) { f = 0 }
+                END { print cf + 0, mf + 0, found + 0, total + 0 }
+              ' test-source.txt)
+              if [ "$class_flaky" = 1 ] || [ "$method_flaky" = 1 ]; then
+                flaky_yes+=("$t")
+              else
+                flaky_no+=("$t")
+                if [ -n "$method" ] && [ "$method_found" = 0 ]; then
+                  echo "::warning::在 ${file} 找不到 method ${method}（可能定義在父類別），當作沒有 @Flaky"
+                elif [ -z "$method" ] && [ "$total" -gt 0 ]; then
+                  echo "::warning::${cls} 裡有 ${total} 個標了 @Flaky 的測試，這次不會跑到；要跑它們請填 ${cls}.method"
+                fi
               fi
-            fi
+            done
           done
 
           flaky=false
@@ -178,8 +183,10 @@ jobs:
             echo "::notice::${flaky_yes[*]} 有 @Flaky，自動加上 -Pkafka.test.run.flaky=true"
           fi
 
-          COMMAND="./gradlew clean"
-          for m in "${modules[@]}"; do COMMAND+=" ${m}:test${by_module[$m]}"; done
+          # 每一輪都要重跑測試、並清掉上一輪的 JUnit XML（junit_failures.py 會掃），所以每個 module 先 cleanTest。
+          # 不用 clean：clean 會連編譯結果都刪掉，每一輪都要重新編譯
+          COMMAND="./gradlew"
+          for m in "${modules[@]}"; do COMMAND+=" ${m}:cleanTest ${m}:test${by_module[$m]}"; done
           echo "::notice::指令：${COMMAND}"
           bash kafka/ci/check_gradle_command.sh "$COMMAND"
           echo "command=$COMMAND" >> "$GITHUB_OUTPUT"
@@ -281,7 +288,7 @@ jobs:
             if [ "$rc" -ne 0 ]; then
               failed=$((failed + 1))
               echo "::warning::c${{ matrix.id }} run $i failed (exit $rc)"
-              # 留下這一輪的 test-results，下一輪 clean 會清掉
+              # 留下這一輪的 test-results，下一輪 cleanTest 會清掉
               (cd kafka && find . -path '*/build/test-results/*' -name 'TEST-*.xml' -print0 \
                 | tar -czf "../out/run-$i-test-results.tgz" --null -T -) || true
             fi
